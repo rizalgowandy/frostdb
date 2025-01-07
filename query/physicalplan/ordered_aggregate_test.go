@@ -5,11 +5,12 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/apache/arrow/go/v10/arrow"
-	"github.com/apache/arrow/go/v10/arrow/array"
-	"github.com/apache/arrow/go/v10/arrow/memory"
+	"go.opentelemetry.io/otel/trace/noop"
+
+	"github.com/apache/arrow/go/v17/arrow"
+	"github.com/apache/arrow/go/v17/arrow/array"
+	"github.com/apache/arrow/go/v17/arrow/memory"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/otel/trace"
 
 	"github.com/polarsignals/frostdb/pqarrow/builder"
 	"github.com/polarsignals/frostdb/query/logicalplan"
@@ -165,18 +166,18 @@ func TestOrderedAggregate(t *testing.T) {
 			valBuilder := builder.NewOptInt64Builder(arrow.PrimitiveTypes.Int64)
 			o := NewOrderedAggregate(
 				memory.DefaultAllocator,
-				trace.NewNoopTracerProvider().Tracer(""),
+				noop.NewTracerProvider().Tracer(""),
 				Aggregation{
 					expr:       logicalplan.Col(valColName),
 					resultName: "result",
-					function:   &Int64SumAggregation{},
+					function:   logicalplan.AggFuncSum,
 				},
 				groupCols,
 				true,
 			)
 			resultCursor := 0
 			o.SetNext(&OutputPlan{
-				callback: func(ctx context.Context, r arrow.Record) error {
+				callback: func(_ context.Context, r arrow.Record) error {
 					if r.NumRows() == 0 {
 						require.True(t, resultCursor < len(tc.resultRecords))
 						return nil
@@ -221,7 +222,7 @@ func TestOrderedAggregate(t *testing.T) {
 							groupBuilders[i].AppendNull()
 							continue
 						}
-						groupBuilders[i].Append([]byte(v))
+						require.NoError(t, groupBuilders[i].Append([]byte(v)))
 					}
 					a := groupBuilders[i].NewArray()
 					recordFields = append(
@@ -272,10 +273,10 @@ func TestOrderedAggregateDynCols(t *testing.T) {
 	ctx := context.Background()
 	o := NewOrderedAggregate(
 		memory.DefaultAllocator,
-		trace.NewNoopTracerProvider().Tracer(""),
+		noop.NewTracerProvider().Tracer(""),
 		Aggregation{
 			expr:     logicalplan.Col(valColName),
-			function: &Int64SumAggregation{},
+			function: logicalplan.AggFuncSum,
 		},
 		[]logicalplan.Expr{
 			logicalplan.DynCol(dynColName),
@@ -304,7 +305,7 @@ func TestOrderedAggregateDynCols(t *testing.T) {
 		groupBuilder := builder.NewOptBinaryBuilder(arrow.BinaryTypes.Binary)
 		valBuilder := builder.NewOptInt64Builder(arrow.PrimitiveTypes.Int64)
 		for j := 0; j < numVals; j++ {
-			groupBuilder.Append([]byte("group"))
+			require.NoError(t, groupBuilder.Append([]byte("group")))
 			valBuilder.Append(1)
 		}
 

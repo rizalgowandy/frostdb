@@ -6,40 +6,41 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"math/rand"
-	"reflect"
-	"regexp"
+	"path/filepath"
 	"runtime"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/apache/arrow/go/v10/arrow"
-	"github.com/apache/arrow/go/v10/arrow/array"
-	"github.com/apache/arrow/go/v10/arrow/memory"
+	"github.com/apache/arrow/go/v17/arrow"
+	"github.com/apache/arrow/go/v17/arrow/array"
+	"github.com/apache/arrow/go/v17/arrow/memory"
+	"github.com/apache/arrow/go/v17/arrow/util"
+	"github.com/dustin/go-humanize"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/google/btree"
-	"github.com/google/uuid"
-	"github.com/oklog/ulid"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
-	"github.com/segmentio/parquet-go"
+	"github.com/oklog/ulid/v2"
+	"github.com/parquet-go/parquet-go"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/protobuf/proto"
 
-	"github.com/polarsignals/frostdb/bufutils"
 	"github.com/polarsignals/frostdb/dynparquet"
 	schemapb "github.com/polarsignals/frostdb/gen/proto/go/frostdb/schema/v1alpha1"
 	schemav2pb "github.com/polarsignals/frostdb/gen/proto/go/frostdb/schema/v1alpha2"
+	tablepb "github.com/polarsignals/frostdb/gen/proto/go/frostdb/table/v1alpha1"
 	walpb "github.com/polarsignals/frostdb/gen/proto/go/frostdb/wal/v1alpha1"
+	"github.com/polarsignals/frostdb/index"
+	"github.com/polarsignals/frostdb/internal/records"
 	"github.com/polarsignals/frostdb/parts"
 	"github.com/polarsignals/frostdb/pqarrow"
 	"github.com/polarsignals/frostdb/query/logicalplan"
+	"github.com/polarsignals/frostdb/query/physicalplan"
+	"github.com/polarsignals/frostdb/recovery"
+	"github.com/polarsignals/frostdb/wal"
 	walpkg "github.com/polarsignals/frostdb/wal"
 )
 
@@ -47,6 +48,16 @@ var (
 	ErrNoSchema     = fmt.Errorf("no schema")
 	ErrTableClosing = fmt.Errorf("table closing")
 )
+
+// DefaultIndexConfig returns the default level configs used. This is a function
+// So that any modifications to the result will not affect the default config.
+func DefaultIndexConfig() []*index.LevelConfig {
+	return []*index.LevelConfig{
+		{Level: index.L0, MaxSize: 1024 * 1024 * 15, Type: index.CompactionTypeParquetMemory},  // Compact to in-memory Parquet buffer after 15MiB of data
+		{Level: index.L1, MaxSize: 1024 * 1024 * 128, Type: index.CompactionTypeParquetMemory}, // Compact to a single in-memory Parquet buffer after 128MiB of Parquet files
+		{Level: index.L2, MaxSize: 1024 * 1024 * 512},                                          // Final level. Rotate after 512MiB of Parquet files
+	}
+}
 
 type ErrWriteRow struct{ err error }
 
@@ -62,47 +73,80 @@ func (e ErrCreateSchemaWriter) Error() string {
 	return "failed to create schema write: " + e.err.Error()
 }
 
-type TableConfig struct {
-	schema *dynparquet.Schema
-	// rowGroupSize is the desired number of rows in each row group.
-	rowGroupSize     int
-	blockReaderLimit int
-	disableWAL       bool
-}
-
-type TableOption func(*TableConfig) error
+type TableOption func(*tablepb.TableConfig) error
 
 // WithRowGroupSize sets the size in number of rows for each row group for parquet files. A <= 0 value indicates no limit.
 func WithRowGroupSize(numRows int) TableOption {
-	return func(config *TableConfig) error {
-		config.rowGroupSize = numRows
+	return func(config *tablepb.TableConfig) error {
+		config.RowGroupSize = uint64(numRows)
 		return nil
 	}
 }
 
 // WithBlockReaderLimit sets the limit of go routines that will be used to read persisted block files. A negative number indicates no limit.
 func WithBlockReaderLimit(n int) TableOption {
-	return func(config *TableConfig) error {
-		config.blockReaderLimit = n
+	return func(config *tablepb.TableConfig) error {
+		config.BlockReaderLimit = uint64(n)
 		return nil
 	}
 }
 
 // WithoutWAL disables the WAL for this table.
 func WithoutWAL() TableOption {
-	return func(config *TableConfig) error {
-		config.disableWAL = true
+	return func(config *tablepb.TableConfig) error {
+		config.DisableWal = true
 		return nil
 	}
 }
 
+func WithUniquePrimaryIndex(unique bool) TableOption {
+	return func(config *tablepb.TableConfig) error {
+		switch e := config.Schema.(type) {
+		case *tablepb.TableConfig_DeprecatedSchema:
+			e.DeprecatedSchema.UniquePrimaryIndex = unique
+		case *tablepb.TableConfig_SchemaV2:
+			e.SchemaV2.UniquePrimaryIndex = unique
+		}
+		return nil
+	}
+}
+
+// FromConfig sets the table configuration from the given config.
+// NOTE: that this does not override the schema even though that is included in the passed in config.
+func FromConfig(config *tablepb.TableConfig) TableOption {
+	return func(cfg *tablepb.TableConfig) error {
+		if config.BlockReaderLimit != 0 { // the zero value is not a valid block reader limit
+			cfg.BlockReaderLimit = config.BlockReaderLimit
+		}
+		cfg.DisableWal = config.DisableWal
+		cfg.RowGroupSize = config.RowGroupSize
+		return nil
+	}
+}
+
+func defaultTableConfig() *tablepb.TableConfig {
+	return &tablepb.TableConfig{
+		BlockReaderLimit: uint64(runtime.GOMAXPROCS(0)),
+	}
+}
+
 func NewTableConfig(
-	schema *dynparquet.Schema,
+	schema proto.Message,
 	options ...TableOption,
-) *TableConfig {
-	t := &TableConfig{
-		schema:           schema,
-		blockReaderLimit: runtime.GOMAXPROCS(0),
+) *tablepb.TableConfig {
+	t := defaultTableConfig()
+
+	switch v := schema.(type) {
+	case *schemapb.Schema:
+		t.Schema = &tablepb.TableConfig_DeprecatedSchema{
+			DeprecatedSchema: v,
+		}
+	case *schemav2pb.Schema:
+		t.Schema = &tablepb.TableConfig_SchemaV2{
+			SchemaV2: v,
+		}
+	default:
+		panic(fmt.Sprintf("unsupported schema type: %T", v))
 	}
 
 	for _, opt := range options {
@@ -117,14 +161,108 @@ type completedBlock struct {
 	tx     uint64
 }
 
+// GenericTable is a wrapper around *Table that writes structs of type T. It
+// consist of  a generic arrow.Record builder that ingests structs of type T.
+// The generated record is then  passed to (*Table).InsertRecord.
+//
+// Struct tag `frostdb` is used to pass options for the schema for T.
+//
+// This api is opinionated.
+//
+//   - Nested Columns are not supported
+//
+// # Tags
+//
+// Use `frostdb` to define tags that customizes field values. You can express
+// everything needed to construct schema v1alpha1.
+//
+// Tags are defined as a comma separated list. The first item is the column
+// name. Column name is optional, when omitted it is derived from the field name
+// (snake_cased)
+//
+// Supported Tags
+//
+//	    delta_binary_packed | Delta binary packed encoding.
+//	                 brotli | Brotli compression.
+//	                    asc | Sorts in ascending order.Use asc(n) where n is an integer for sorting order.
+//	                   gzip | GZIP compression.
+//	                 snappy | Snappy compression.
+//	delta_length_byte_array | Delta Length Byte Array encoding.
+//	       delta_byte_array | Delta Byte Array encoding.
+//	                   desc | Sorts in descending order.Use desc(n) where n is an integer for sorting order
+//	                lz4_raw | LZ4_RAW compression.
+//	               pre_hash | Prehash the column before storing it.
+//	             null_first | When used wit asc nulls are smallest and with des nulls are largest.
+//	                   zstd | ZSTD compression.
+//	               rle_dict | Dictionary run-length encoding.
+//	                  plain | Plain encoding.
+//
+// Example tagged Sample struct
+//
+//	type Sample struct {
+//		ExampleType string      `frostdb:"example_type,rle_dict,asc(0)"`
+//		Labels      []Label     `frostdb:"labels,rle_dict,null,dyn,asc(1),null_first"`
+//		Stacktrace  []uuid.UUID `frostdb:"stacktrace,rle_dict,asc(3),null_first"`
+//		Timestamp   int64       `frostdb:"timestamp,asc(2)"`
+//		Value       int64       `frostdb:"value"`
+//	}
+//
+// # Dynamic columns
+//
+// Field of type map<string, T> is a dynamic column by default.
+//
+//	type Example struct {
+//		// Use supported tags to customize the column value
+//		Labels map[string]string `frostdb:"labels"`
+//	}
+//
+// # Repeated columns
+//
+// Fields of type []int64, []float64, []bool, and []string are supported. These
+// are represented as arrow.LIST.
+//
+// Generated schema for the repeated columns applies all supported tags. By
+// default repeated fields are nullable. You can safely pass nil slices for
+// repeated columns.
+type GenericTable[T any] struct {
+	*Table
+	mu    sync.Mutex
+	build *records.Build[T]
+}
+
+func (t *GenericTable[T]) Release() {
+	t.build.Release()
+}
+
+// Write builds arrow.Record directly from values and calls (*Table).InsertRecord.
+func (t *GenericTable[T]) Write(ctx context.Context, values ...T) (uint64, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	err := t.build.Append(values...)
+	if err != nil {
+		return 0, err
+	}
+	return t.InsertRecord(ctx, t.build.NewRecord())
+}
+
+func NewGenericTable[T any](db *DB, name string, mem memory.Allocator, options ...TableOption) (*GenericTable[T], error) {
+	build := records.NewBuild[T](mem)
+	table, err := db.Table(name, NewTableConfig(build.Schema(name), options...))
+	if err != nil {
+		return nil, err
+	}
+	return &GenericTable[T]{build: build, Table: table}, nil
+}
+
 type Table struct {
 	db      *DB
 	name    string
-	metrics *tableMetrics
+	metrics tableMetrics
 	logger  log.Logger
 	tracer  trace.Tracer
 
-	config *TableConfig
+	config atomic.Pointer[tablepb.TableConfig]
+	schema *dynparquet.Schema
 
 	pendingBlocks   map[*TableBlock]struct{}
 	completedBlocks []completedBlock
@@ -137,13 +275,25 @@ type Table struct {
 	closing bool
 }
 
+type Sync interface {
+	Sync() error
+}
+
 type WAL interface {
 	Close() error
 	Log(tx uint64, record *walpb.Record) error
 	LogRecord(tx uint64, table string, record arrow.Record) error
-	Replay(handler func(tx uint64, record *walpb.Record) error) error
+	// Replay replays WAL records from the given first index. If firstIndex is
+	// 0, the first index read from the WAL is used (i.e. given a truncation,
+	// using 0 is still valid). If the given firstIndex is less than the WAL's
+	// first index on disk, the replay happens from the first index on disk.
+	// If the handler panics, the WAL implementation will truncate the WAL up to
+	// the last valid index.
+	Replay(tx uint64, handler wal.ReplayHandlerFunc) error
 	Truncate(tx uint64) error
+	Reset(nextTx uint64) error
 	FirstIndex() (uint64, error)
+	LastIndex() (uint64, error)
 }
 
 type TableBlock struct {
@@ -155,34 +305,46 @@ type TableBlock struct {
 	minTx  uint64
 	prevTx uint64
 
-	size  *atomic.Int64
-	index *atomic.Pointer[btree.BTree] // *btree.BTree
+	// uncompressedInsertsSize keeps track of the cumulative L0 size. This is
+	// not the size of the block, since these inserts are eventually compressed.
+	// However, it serves to determine when to perform a snapshot, since these
+	// uncompressed inserts are stored in the WAL, and if the node crashes, it
+	// is obliged to re-read all of these uncompressed inserts into memory,
+	// potentially causing OOMs.
+	uncompressedInsertsSize atomic.Int64
+	// lastSnapshotSize keeps track of the uncompressedInsertsSize when a
+	// snapshot was last triggered.
+	lastSnapshotSize atomic.Int64
+
+	index *index.LSM
 
 	pendingWritersWg sync.WaitGroup
+	pendingReadersWg sync.WaitGroup
 
 	mtx *sync.RWMutex
 }
 
-type tableMetrics struct {
-	blockRotated              prometheus.Counter
-	granulesCreated           prometheus.Counter
-	compactions               prometheus.Counter
-	granulesSplits            prometheus.Counter
-	rowsInserted              prometheus.Counter
-	zeroRowsInserted          prometheus.Counter
-	granulesCompactionAborted prometheus.Counter
-	rowInsertSize             prometheus.Histogram
-	lastCompletedBlockTx      prometheus.Gauge
-	numParts                  prometheus.Gauge
-	unsortedInserts           prometheus.Counter
-	compactionMetrics         *compactionMetrics
+type Closer interface {
+	Close(cleanup bool) error
+}
+
+func schemaFromTableConfig(tableConfig *tablepb.TableConfig) (*dynparquet.Schema, error) {
+	switch schema := tableConfig.Schema.(type) {
+	case *tablepb.TableConfig_DeprecatedSchema:
+		return dynparquet.SchemaFromDefinition(schema.DeprecatedSchema)
+	case *tablepb.TableConfig_SchemaV2:
+		return dynparquet.SchemaFromDefinition(schema.SchemaV2)
+	default:
+		// No schema defined for table; read/only table
+		return nil, nil
+	}
 }
 
 func newTable(
 	db *DB,
 	name string,
-	tableConfig *TableConfig,
-	reg prometheus.Registerer,
+	tableConfig *tablepb.TableConfig,
+	metrics tableMetrics,
 	logger log.Logger,
 	tracer trace.Tracer,
 	wal WAL,
@@ -197,92 +359,35 @@ func newTable(
 		return nil, errors.New(msg)
 	}
 
-	reg = prometheus.WrapRegistererWith(prometheus.Labels{"table": name}, reg)
-
-	t := &Table{
-		db:     db,
-		config: tableConfig,
-		name:   name,
-		logger: logger,
-		tracer: tracer,
-		mtx:    &sync.RWMutex{},
-		wal:    wal,
-		metrics: &tableMetrics{
-			numParts: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
-				Name: "num_parts",
-				Help: "Number of parts currently active.",
-			}),
-			blockRotated: promauto.With(reg).NewCounter(prometheus.CounterOpts{
-				Name: "blocks_rotated_total",
-				Help: "Number of table blocks that have been rotated.",
-			}),
-			granulesCreated: promauto.With(reg).NewCounter(prometheus.CounterOpts{
-				Name: "granules_created_total",
-				Help: "Number of granules created.",
-			}),
-			compactions: promauto.With(reg).NewCounter(prometheus.CounterOpts{
-				Name: "granules_compactions_total",
-				Help: "Number of granule compactions.",
-			}),
-			granulesSplits: promauto.With(reg).NewCounter(prometheus.CounterOpts{
-				Name: "granules_splits_total",
-				Help: "Number of granules splits executed.",
-			}),
-			granulesCompactionAborted: promauto.With(reg).NewCounter(prometheus.CounterOpts{
-				Name: "granules_compaction_aborted_total",
-				Help: "Number of aborted granules compaction.",
-			}),
-			rowsInserted: promauto.With(reg).NewCounter(prometheus.CounterOpts{
-				Name: "rows_inserted_total",
-				Help: "Number of rows inserted into table.",
-			}),
-			zeroRowsInserted: promauto.With(reg).NewCounter(prometheus.CounterOpts{
-				Name: "zero_rows_inserted_total",
-				Help: "Number of times it was attempted to insert zero rows into the table.",
-			}),
-			rowInsertSize: promauto.With(reg).NewHistogram(prometheus.HistogramOpts{
-				Name:    "row_insert_size",
-				Help:    "Size of batch inserts into table.",
-				Buckets: prometheus.ExponentialBuckets(1, 2, 10),
-			}),
-			lastCompletedBlockTx: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
-				Name: "last_completed_block_tx",
-				Help: "Last completed block transaction.",
-			}),
-			unsortedInserts: promauto.With(reg).NewCounter(prometheus.CounterOpts{
-				Name: "unsorted_inserts_total",
-				Help: "The number of times a buffer to insert was not in sorted order.",
-			}),
-			compactionMetrics: newCompactionMetrics(reg, float64(db.columnStore.granuleSizeBytes)),
-		},
+	if tableConfig == nil {
+		tableConfig = defaultTableConfig()
 	}
 
+	s, err := schemaFromTableConfig(tableConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	t := &Table{
+		db:      db,
+		name:    name,
+		logger:  logger,
+		tracer:  tracer,
+		mtx:     &sync.RWMutex{},
+		wal:     wal,
+		schema:  s,
+		metrics: metrics,
+	}
+
+	// Store the table config
+	t.config.Store(tableConfig)
+
 	// Disable the WAL for this table by replacing any given WAL with a nop wal
-	if tableConfig.disableWAL {
+	if tableConfig.DisableWal {
 		t.wal = &walpkg.NopWAL{}
 	}
 
 	t.pendingBlocks = make(map[*TableBlock]struct{})
-
-	promauto.With(reg).NewGaugeFunc(prometheus.GaugeOpts{
-		Name: "index_size",
-		Help: "Number of granules in the table index currently.",
-	}, func() float64 {
-		if active := t.ActiveBlock(); active != nil {
-			return float64(active.Index().Len())
-		}
-		return 0
-	})
-
-	promauto.With(reg).NewGaugeFunc(prometheus.GaugeOpts{
-		Name: "active_table_block_size",
-		Help: "Size of the active table block in bytes.",
-	}, func() float64 {
-		if active := t.ActiveBlock(); active != nil {
-			return float64(active.Size())
-		}
-		return 0
-	})
 
 	return t, nil
 }
@@ -293,28 +398,14 @@ func (t *Table) newTableBlock(prevTx, tx uint64, id ulid.ULID) error {
 		return err
 	}
 
-	walTableBlock := &walpb.Entry_NewTableBlock{
-		TableName: t.name,
-		BlockId:   b,
-	}
-
-	switch v := t.config.schema.Definition().(type) {
-	case *schemapb.Schema:
-		walTableBlock.Schema = &walpb.Entry_NewTableBlock_DeprecatedSchema{
-			DeprecatedSchema: v,
-		}
-	case *schemav2pb.Schema:
-		walTableBlock.Schema = &walpb.Entry_NewTableBlock_SchemaV2{
-			SchemaV2: v,
-		}
-	default:
-		return fmt.Errorf("unknown schema type: %t", v)
-	}
-
 	if err := t.wal.Log(tx, &walpb.Record{
 		Entry: &walpb.Entry{
 			EntryType: &walpb.Entry_NewTableBlock_{
-				NewTableBlock: walTableBlock,
+				NewTableBlock: &walpb.Entry_NewTableBlock{
+					TableName: t.name,
+					BlockId:   b,
+					Config:    t.config.Load(),
+				},
 			},
 		},
 	}); err != nil {
@@ -332,29 +423,39 @@ func (t *Table) newTableBlock(prevTx, tx uint64, id ulid.ULID) error {
 func (t *Table) dropPendingBlock(block *TableBlock) {
 	t.mtx.Lock()
 	defer t.mtx.Unlock()
-	block.Index().Ascend(func(i btree.Item) bool {
-		g := i.(*Granule)
-		g.PartsForTx(math.MaxUint64, func(p *parts.Part) bool {
-			if r := p.Record(); r != nil {
-				r.Release()
-			}
-			return true
-		})
-		return true
-	})
 	delete(t.pendingBlocks, block)
+
+	// Wait for outstanding readers/writers to finish with the block before releasing underlying resources.
+	block.pendingReadersWg.Wait()
+	block.pendingWritersWg.Wait()
+
+	if err := block.index.Close(); err != nil {
+		level.Error(t.logger).Log("msg", "failed to close index", "err", err)
+	}
 }
 
-func (t *Table) writeBlock(block *TableBlock) {
-	level.Debug(t.logger).Log("msg", "syncing block")
+func (t *Table) writeBlock(
+	block *TableBlock, nextTxn uint64, snapshotDB bool, opts ...RotateBlockOption,
+) {
+	rbo := &rotateBlockOptions{}
+	for _, o := range opts {
+		o(rbo)
+	}
+	if rbo.wg != nil {
+		defer rbo.wg.Done()
+	}
+	level.Debug(t.logger).Log("msg", "syncing block", "next_txn", nextTxn, "ulid", block.ulid, "size", block.index.Size())
 	block.pendingWritersWg.Wait()
 
 	// from now on, the block will no longer be modified, we can persist it to disk
 
-	level.Debug(t.logger).Log("msg", "done syncing block")
+	level.Debug(t.logger).Log("msg", "done syncing block", "next_txn", nextTxn, "ulid", block.ulid, "size", block.index.Size())
 
 	// Persist the block
-	err := block.Persist()
+	var err error
+	if !rbo.skipPersist && block.index.Size() != 0 {
+		err = block.Persist()
+	}
 	t.dropPendingBlock(block)
 	if err != nil {
 		level.Error(t.logger).Log("msg", "failed to persist block")
@@ -362,26 +463,37 @@ func (t *Table) writeBlock(block *TableBlock) {
 		return
 	}
 
-	tx, _, commit := t.db.begin()
-	defer commit()
+	if err := func() error {
+		tx, _, commit := t.db.begin()
+		defer commit()
 
-	buf, err := block.ulid.MarshalBinary()
-	if err != nil {
-		level.Error(t.logger).Log("msg", "failed to record block persistence in WAL: marshal ulid", "err", err)
-		return
-	}
+		buf, err := block.ulid.MarshalBinary()
+		if err != nil {
+			level.Error(t.logger).Log("msg", "failed to record block persistence in WAL: marshal ulid", "err", err)
+			return err
+		}
 
-	if err := t.wal.Log(tx, &walpb.Record{
-		Entry: &walpb.Entry{
-			EntryType: &walpb.Entry_TableBlockPersisted_{
-				TableBlockPersisted: &walpb.Entry_TableBlockPersisted{
-					TableName: t.name,
-					BlockId:   buf,
+		level.Debug(t.logger).Log("msg", "recording block persistence in WAL", "ulid", block.ulid, "txn", tx)
+		if err := t.wal.Log(tx, &walpb.Record{
+			Entry: &walpb.Entry{
+				EntryType: &walpb.Entry_TableBlockPersisted_{
+					TableBlockPersisted: &walpb.Entry_TableBlockPersisted{
+						TableName: t.name,
+						BlockId:   buf,
+						// NOTE: nextTxn is used here instead of tx, since some
+						// writes could have happened between block rotation
+						// and the txn beginning above.
+						NextTx: nextTxn,
+					},
 				},
 			},
-		},
-	}); err != nil {
-		level.Error(t.logger).Log("msg", "failed to record block persistence in WAL", "err", err)
+		}); err != nil {
+			level.Error(t.logger).Log("msg", "failed to record block persistence in WAL", "err", err)
+			return err
+		}
+
+		return nil
+	}(); err != nil {
 		return
 	}
 
@@ -404,34 +516,118 @@ func (t *Table) writeBlock(block *TableBlock) {
 	}
 	t.mtx.Unlock()
 	t.db.maintainWAL()
+	if snapshotDB && t.db.columnStore.snapshotTriggerSize != 0 && t.db.columnStore.enableWAL {
+		func() {
+			if !t.db.snapshotInProgress.CompareAndSwap(false, true) {
+				// Snapshot already in progress. This could lead to duplicate
+				// data when replaying (refer to the snapshot design document),
+				// but discarding this data on recovery is better than a
+				// potential additional CPU spike caused by another snapshot.
+				return
+			}
+			defer t.db.snapshotInProgress.Store(false)
+			// This snapshot snapshots the new, active, table block. Refer to
+			// the snapshot design document for more details as to why this
+			// snapshot is necessary.
+			// context.Background is used here for the snapshot since callers
+			// might cancel the context when the write is finished but the
+			// snapshot is not. Note that block.Persist does the same.
+			// TODO(asubiotto): Eventually we should register a cancel function
+			// that is called with a grace period on db.Close.
+			ctx := context.Background()
+			tx := t.db.beginRead()
+			if err := t.db.snapshotAtTX(ctx, tx, t.db.snapshotWriter(tx)); err != nil {
+				level.Error(t.logger).Log(
+					"msg", "failed to write snapshot on block rotation",
+					"err", err,
+				)
+			}
+			if err := t.db.reclaimDiskSpace(ctx, nil); err != nil {
+				level.Error(t.logger).Log(
+					"msg", "failed to reclaim disk space after snapshot on block rotation",
+					"err", err,
+				)
+				return
+			}
+		}()
+	}
 }
 
-func (t *Table) RotateBlock(block *TableBlock) error {
+type rotateBlockOptions struct {
+	skipPersist bool
+	wg          *sync.WaitGroup
+}
+
+type RotateBlockOption func(*rotateBlockOptions)
+
+// WithRotateBlockSkipPersist instructs the block rotation operation to not
+// persist the block to object storage.
+func WithRotateBlockSkipPersist() RotateBlockOption {
+	return func(o *rotateBlockOptions) {
+		o.skipPersist = true
+	}
+}
+
+// WithRotateBlockWaitGroup provides a WaitGroup. The rotate block operation
+// will call wg.Done once the block has been persisted. Otherwise, RotateBlock
+// asynchronously persists the block.
+func WithRotateBlockWaitGroup(wg *sync.WaitGroup) RotateBlockOption {
+	return func(o *rotateBlockOptions) {
+		o.wg = wg
+	}
+}
+
+func (t *Table) RotateBlock(_ context.Context, block *TableBlock, opts ...RotateBlockOption) error {
+	rbo := &rotateBlockOptions{}
+	for _, o := range opts {
+		o(rbo)
+	}
 	t.mtx.Lock()
 	defer t.mtx.Unlock()
 
 	// Need to check that we haven't already rotated this block.
 	if t.active != block {
+		if rbo.wg != nil {
+			rbo.wg.Done()
+		}
 		return nil
 	}
 
-	level.Debug(t.logger).Log("msg", "rotating block", "blockSize", block.Size())
-	defer func() {
-		level.Debug(t.logger).Log("msg", "done rotating block")
-	}()
+	level.Debug(t.logger).Log(
+		"msg", "rotating block",
+		"ulid", block.ulid,
+		"size", block.Size(),
+		"skip_persist", rbo.skipPersist,
+	)
+	defer level.Debug(t.logger).Log("msg", "done rotating block", "ulid", block.ulid)
 
 	tx, _, commit := t.db.begin()
 	defer commit()
 
 	id := generateULID()
+	for id.Time() == block.ulid.Time() { // Ensure the new block has a different timestamp.
+		// Sleep a millisecond to ensure the ULID has a different timestamp.
+		time.Sleep(time.Millisecond)
+		id = generateULID()
+	}
 	if err := t.newTableBlock(t.active.minTx, tx, id); err != nil {
 		return err
 	}
 	t.metrics.blockRotated.Inc()
 	t.metrics.numParts.Set(float64(0))
 
-	t.pendingBlocks[block] = struct{}{}
-	go t.writeBlock(block)
+	if !rbo.skipPersist {
+		// If skipping persist, this block rotation is simply a block discard,
+		// so no need to add this block to pending blocks. Some callers rely
+		// on the fact that blocks are not available for reads as soon as
+		// RotateBlock returns with skipPersist=true.
+		t.pendingBlocks[block] = struct{}{}
+	}
+	// We don't check t.db.columnStore.manualBlockRotation here because this is
+	// the entry point for users to trigger a manual block rotation and they
+	// will specify through skipPersist if they want the block to be persisted.
+	go t.writeBlock(block, tx, true, opts...)
+
 	return nil
 }
 
@@ -455,253 +651,89 @@ func (t *Table) ActiveWriteBlock() (*TableBlock, func(), error) {
 }
 
 func (t *Table) Schema() *dynparquet.Schema {
-	if t.config == nil {
+	if t.config.Load() == nil {
 		return nil
 	}
-	return t.config.schema
+	return t.schema
 }
 
 func (t *Table) EnsureCompaction() error {
 	return t.ActiveBlock().EnsureCompaction()
 }
 
-// Write objects into the table.
-func (t *Table) Write(ctx context.Context, vals ...any) (uint64, error) {
-	b, err := ValuesToBuffer(t.Schema(), vals...)
-	if err != nil {
-		return 0, err
-	}
-
-	return t.InsertBuffer(ctx, b)
-}
-
-var (
-	matchFirstCap = regexp.MustCompile("(.)([A-Z][a-z]+)")
-	matchAllCap   = regexp.MustCompile("([a-z0-9])([A-Z])")
-)
-
-func ToSnakeCase(str string) string {
-	snake := matchFirstCap.ReplaceAllString(str, "${1}_${2}")
-	snake = matchAllCap.ReplaceAllString(snake, "${1}_${2}")
-	return strings.ToLower(snake)
-}
-
-func ValuesToBuffer(schema *dynparquet.Schema, vals ...any) (*dynparquet.Buffer, error) {
-	dynamicColumns := map[string][]string{}
-	rows := make([]parquet.Row, 0, len(vals))
-
-	findColumn := func(val reflect.Value, col string, v any) any {
-		for i := 0; i < val.NumField(); i++ {
-			if ToSnakeCase(val.Type().Field(i).Name) == col {
-				return val.Field(i).Interface()
-			}
-		}
-		return nil
-	}
-
-	// Collect dynamic columns
-	for _, v := range vals {
-		val := reflect.ValueOf(v)
-		for _, col := range schema.Columns() {
-			cv := findColumn(val, col.Name, v)
-			switch col.Dynamic {
-			case true:
-				switch reflect.TypeOf(cv).Kind() {
-				case reflect.Struct:
-					dynVals := reflect.ValueOf(cv)
-					for j := 0; j < dynVals.NumField(); j++ {
-						dynamicColumns[col.Name] = append(dynamicColumns[col.Name], ToSnakeCase(dynVals.Type().Field(j).Name))
-					}
-				case reflect.Slice:
-					dynVals := reflect.ValueOf(cv)
-					for j := 0; j < dynVals.Len(); j++ {
-						pair := reflect.ValueOf(dynVals.Index(j).Interface())
-						dynamicColumns[col.Name] = append(dynamicColumns[col.Name], ToSnakeCase(fmt.Sprintf("%v", pair.Field(0))))
-					}
-				default:
-					return nil, fmt.Errorf("unsupported dynamic type")
-				}
-			}
-		}
-	}
-
-	dynamicColumns = bufutils.Dedupe(dynamicColumns)
-
-	// Create all rows
-	for _, v := range vals {
-		row := []parquet.Value{}
-		val := reflect.ValueOf(v)
-
-		colIdx := 0
-		for _, col := range schema.Columns() {
-			cv := findColumn(val, col.Name, v)
-			switch col.Dynamic {
-			case true:
-				switch reflect.TypeOf(cv).Kind() {
-				case reflect.Struct:
-					dynVals := reflect.ValueOf(cv)
-					for _, dyncol := range dynamicColumns[col.Name] {
-						found := false
-						for j := 0; j < dynVals.NumField(); j++ {
-							if ToSnakeCase(dynVals.Type().Field(j).Name) == dyncol {
-								row = append(row, parquet.ValueOf(dynVals.Field(j).Interface()).Level(0, 1, colIdx))
-								colIdx++
-								found = true
-								break
-							}
-						}
-						if !found {
-							row = append(row, parquet.ValueOf(nil).Level(0, 0, colIdx))
-							colIdx++
-						}
-					}
-				case reflect.Slice:
-					dynVals := reflect.ValueOf(cv)
-					for _, dyncol := range dynamicColumns[col.Name] {
-						found := false
-						for j := 0; j < dynVals.Len(); j++ {
-							pair := reflect.ValueOf(dynVals.Index(j).Interface())
-							if ToSnakeCase(fmt.Sprintf("%v", pair.Field(0).Interface())) == dyncol {
-								row = append(row, parquet.ValueOf(pair.Field(1).Interface()).Level(0, 1, colIdx))
-								colIdx++
-								found = true
-								break
-							}
-						}
-						if !found {
-							row = append(row, parquet.ValueOf(nil).Level(0, 0, colIdx))
-							colIdx++
-						}
-					}
-				default:
-					return nil, fmt.Errorf("unsupported dynamic type")
-				}
-			default:
-				switch t := cv.(type) {
-				case []uuid.UUID: // Special handling for this type
-					row = append(row, parquet.ValueOf(dynparquet.ExtractLocationIDs(t)).Level(0, 0, colIdx))
-				default:
-					row = append(row, parquet.ValueOf(cv).Level(0, 0, colIdx))
-				}
-				colIdx++
-			}
-		}
-
-		rows = append(rows, row)
-	}
-
-	pb, err := schema.NewBuffer(dynamicColumns)
-	if err != nil {
-		return nil, err
-	}
-
-	_, err = pb.WriteRows(rows)
-	if err != nil {
-		return nil, err
-	}
-
-	return pb, nil
-}
-
 func (t *Table) InsertRecord(ctx context.Context, record arrow.Record) (uint64, error) {
-	block, close, err := t.appender()
+	block, finish, err := t.appender(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("get appender: %w", err)
 	}
-	defer close()
+	defer finish()
 
 	tx, _, commit := t.db.begin()
 	defer commit()
 
-	if err := t.wal.LogRecord(tx, t.name, record); err != nil {
+	preHashedRecord := dynparquet.PrehashColumns(t.schema, record)
+	defer preHashedRecord.Release()
+
+	if err := t.wal.LogRecord(tx, t.name, preHashedRecord); err != nil {
 		return tx, fmt.Errorf("append to log: %w", err)
 	}
 
-	if err := block.InsertRecord(ctx, tx, record); err != nil {
+	if err := block.InsertRecord(ctx, tx, preHashedRecord); err != nil {
 		return tx, fmt.Errorf("insert buffer into block: %w", err)
 	}
 
 	return tx, nil
 }
 
-func (t *Table) InsertBuffer(ctx context.Context, buf *dynparquet.Buffer) (uint64, error) {
-	b := bytes.NewBuffer(nil)
-	err := t.config.schema.SerializeBuffer(b, buf) // TODO should we abort this function? If a large buffer is passed this could get long potentially...
-	if err != nil {
-		return 0, fmt.Errorf("serialize buffer: %w", err)
-	}
-
-	return t.Insert(ctx, b.Bytes())
-}
-
-func (t *Table) Insert(ctx context.Context, buf []byte) (uint64, error) {
-	return t.insert(ctx, buf)
-}
-
-func (t *Table) appendToLog(ctx context.Context, tx uint64, buf []byte) error {
-	if err := t.wal.Log(tx, &walpb.Record{
-		Entry: &walpb.Entry{
-			EntryType: &walpb.Entry_Write_{
-				Write: &walpb.Entry_Write{
-					Data:      buf,
-					TableName: t.name,
-				},
-			},
-		},
-	}); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (t *Table) appender() (*TableBlock, func(), error) {
+func (t *Table) appender(ctx context.Context) (*TableBlock, func(), error) {
 	for {
 		// Using active write block is important because it ensures that we don't
 		// miss pending writers when synchronizing the block.
-		block, close, err := t.ActiveWriteBlock()
+		block, finish, err := t.ActiveWriteBlock()
 		if err != nil {
 			return nil, nil, err
 		}
 
-		if block.Size() < t.db.columnStore.activeMemorySize {
-			return block, close, nil
+		uncompressedInsertsSize := block.uncompressedInsertsSize.Load()
+		if t.db.columnStore.snapshotTriggerSize != 0 &&
+			// If size-lastSnapshotSize > snapshotTriggerSize (a column store
+			// option), a new snapshot is triggered. This is basically the size
+			// of the new data in this block since the last snapshot.
+			uncompressedInsertsSize-block.lastSnapshotSize.Load() > t.db.columnStore.snapshotTriggerSize {
+			// context.Background is used here for the snapshot since callers
+			// might cancel the context when the write is finished but the
+			// snapshot is not.
+			// TODO(asubiotto): Eventually we should register a cancel function
+			// that is called with a grace period on db.Close.
+			t.db.asyncSnapshot(context.Background(), func() {
+				level.Debug(t.logger).Log(
+					"msg", "successful snapshot on block size trigger",
+					"block_size", humanize.IBytes(uint64(uncompressedInsertsSize)),
+					"last_snapshot_size", humanize.IBytes(uint64(block.lastSnapshotSize.Load())),
+				)
+				block.lastSnapshotSize.Store(uncompressedInsertsSize)
+				if err := t.db.reclaimDiskSpace(context.Background(), nil); err != nil {
+					level.Error(t.logger).Log(
+						"msg", "failed to reclaim disk space after snapshot",
+						"err", err,
+					)
+					return
+				}
+			})
+		}
+		blockSize := block.Size()
+		if blockSize < t.db.columnStore.activeMemorySize || t.db.columnStore.manualBlockRotation {
+			return block, finish, nil
 		}
 
 		// We need to rotate the block and the writer won't actually be used.
-		close()
+		finish()
 
-		err = t.RotateBlock(block)
+		err = t.RotateBlock(ctx, block)
 		if err != nil {
 			return nil, nil, fmt.Errorf("rotate block: %w", err)
 		}
 	}
-}
-
-func (t *Table) insert(ctx context.Context, buf []byte) (uint64, error) {
-	block, close, err := t.appender()
-	if err != nil {
-		return 0, fmt.Errorf("get appender: %w", err)
-	}
-	defer close()
-
-	tx, _, commit := t.db.begin()
-	defer commit()
-
-	if err := t.appendToLog(ctx, tx, buf); err != nil {
-		return tx, fmt.Errorf("append to log: %w", err)
-	}
-
-	serBuf, err := dynparquet.ReaderFromBytes(buf)
-	if err != nil {
-		return tx, fmt.Errorf("deserialize buffer: %w", err)
-	}
-
-	err = block.Insert(ctx, tx, serBuf)
-	if err != nil {
-		return tx, fmt.Errorf("insert buffer into block: %w", err)
-	}
-
-	return tx, nil
 }
 
 func (t *Table) View(ctx context.Context, fn func(ctx context.Context, tx uint64) error) error {
@@ -710,20 +742,6 @@ func (t *Table) View(ctx context.Context, fn func(ctx context.Context, tx uint64
 	span.SetAttributes(attribute.Int64("tx", int64(tx))) // Attributes don't support uint64...
 	defer span.End()
 	return fn(ctx, tx)
-}
-
-// prepareForFlush sets the nullability on a Record column if the type is a
-// ListType.
-// TODO: Is this a bug in arrow? We already set the nullability in
-// parquetColumnToArrowArray, but it doesn't appear to transfer into the
-// resulting array's type. Needs to be investigated.
-func prepareForFlush(r arrow.Record, schema *parquet.Schema) {
-	for i, c := range r.Columns() {
-		switch t := c.DataType().(type) {
-		case *arrow.ListType:
-			t.SetElemNullable(schema.Fields()[i].Optional())
-		}
-	}
 }
 
 // Iterator iterates in order over all granules in the table. It stops iterating when the iterator function returns false.
@@ -748,6 +766,16 @@ func (t *Table) Iterator(
 		return errors.New("no callbacks provided")
 	}
 	rowGroups := make(chan any, len(callbacks)*4) // buffer up to 4 row groups per callback
+	defer func() {                                // Drain the channel of any leftover parts due to cancellation or error
+		for rg := range rowGroups {
+			switch t := rg.(type) {
+			case index.ReleaseableRowGroup:
+				t.Release()
+			case arrow.Record:
+				t.Release()
+			}
+		}
+	}()
 
 	// Previously we sorted all row groups into a single row group here,
 	// but it turns out that none of the downstream uses actually rely on
@@ -762,11 +790,9 @@ func (t *Table) Iterator(
 	errg, ctx := errgroup.WithContext(ctx)
 	for _, callback := range callbacks {
 		callback := callback
-		errg.Go(func() error {
+		errg.Go(recovery.Do(func() error {
 			converter := pqarrow.NewParquetConverter(pool, *iterOpts)
 			defer converter.Close()
-
-			var rgSchema *parquet.Schema
 
 			for {
 				select {
@@ -775,27 +801,28 @@ func (t *Table) Iterator(
 				case rg, ok := <-rowGroups:
 					if !ok {
 						r := converter.NewRecord()
-						if r == nil || r.NumRows() == 0 {
+						if r == nil {
 							return nil
 						}
-						prepareForFlush(r, rgSchema)
-						if err := callback(ctx, r); err != nil {
-							return err
+						defer r.Release()
+						if r.NumRows() == 0 {
+							return nil
 						}
-						r.Release()
-						return nil
+						return callback(ctx, r)
 					}
 
-					switch t := rg.(type) {
+					switch rg := rg.(type) {
 					case arrow.Record:
-						err := callback(ctx, t)
-						t.Release()
+						defer rg.Release()
+						r := pqarrow.Project(rg, iterOpts.PhysicalProjection)
+						defer r.Release()
+						err := callback(ctx, r)
 						if err != nil {
 							return err
 						}
-					case dynparquet.DynamicRowGroup:
-						rgSchema = t.Schema()
-						if err := converter.Convert(ctx, t); err != nil {
+					case index.ReleaseableRowGroup:
+						defer rg.Release()
+						if err := converter.Convert(ctx, rg, t.schema); err != nil {
 							return fmt.Errorf("failed to convert row group to arrow record: %v", err)
 						}
 						// This RowGroup had no relevant data. Ignore it.
@@ -803,27 +830,46 @@ func (t *Table) Iterator(
 							continue
 						}
 						if converter.NumRows() >= bufferSize {
-							r := converter.NewRecord()
-							prepareForFlush(r, rgSchema)
-							if err := callback(ctx, r); err != nil {
+							err := func() error {
+								r := converter.NewRecord()
+								defer r.Release()
+								converter.Reset() // Reset the converter to drop any dictionaries that were built.
+								return callback(ctx, r)
+							}()
+							if err != nil {
 								return err
 							}
-							r.Release()
+						}
+					case dynparquet.DynamicRowGroup:
+						if err := converter.Convert(ctx, rg, t.schema); err != nil {
+							return fmt.Errorf("failed to convert row group to arrow record: %v", err)
+						}
+						// This RowGroup had no relevant data. Ignore it.
+						if len(converter.Fields()) == 0 {
+							continue
+						}
+						if converter.NumRows() >= bufferSize {
+							err := func() error {
+								r := converter.NewRecord()
+								defer r.Release()
+								converter.Reset() // Reset the converter to drop any dictionaries that were built.
+								return callback(ctx, r)
+							}()
+							if err != nil {
+								return err
+							}
 						}
 					default:
 						return fmt.Errorf("unknown row group type: %T", t)
 					}
 				}
 			}
-		})
+		}, t.logger))
 	}
 
 	errg.Go(func() error {
-		if err := t.collectRowGroups(ctx, tx, iterOpts.Filter, rowGroups); err != nil {
-			return err
-		}
-		close(rowGroups)
-		return nil
+		defer close(rowGroups)
+		return t.collectRowGroups(ctx, tx, iterOpts.Filter, iterOpts.ReadMode, rowGroups)
 	})
 
 	return errg.Wait()
@@ -853,6 +899,16 @@ func (t *Table) SchemaIterator(
 	}
 
 	rowGroups := make(chan any, len(callbacks)*4) // buffer up to 4 row groups per callback
+	defer func() {                                // Drain the channel of any leftover parts due to cancellation or error
+		for rg := range rowGroups {
+			switch t := rg.(type) {
+			case index.ReleaseableRowGroup:
+				t.Release()
+			case arrow.Record:
+				t.Release()
+			}
+		}
+	}()
 
 	schema := arrow.NewSchema(
 		[]arrow.Field{
@@ -864,7 +920,7 @@ func (t *Table) SchemaIterator(
 	errg, ctx := errgroup.WithContext(ctx)
 	for _, callback := range callbacks {
 		callback := callback
-		errg.Go(func() error {
+		errg.Go(recovery.Do(func() error {
 			for {
 				select {
 				case <-ctx.Done():
@@ -878,8 +934,8 @@ func (t *Table) SchemaIterator(
 
 					switch t := rg.(type) {
 					case arrow.Record:
-						for _, f := range t.Schema().Fields() {
-							b.Field(0).(*array.StringBuilder).Append(f.Name)
+						for i := 0; i < t.Schema().NumFields(); i++ {
+							b.Field(0).(*array.StringBuilder).Append(t.Schema().Field(i).Name)
 						}
 						record := b.NewRecord()
 						err := callback(ctx, record)
@@ -888,6 +944,25 @@ func (t *Table) SchemaIterator(
 						if err != nil {
 							return err
 						}
+					case index.ReleaseableRowGroup:
+						if rg == nil {
+							return errors.New("received nil rowGroup") // shouldn't happen, but anyway
+						}
+						defer t.Release()
+						parquetFields := t.Schema().Fields()
+						fieldNames := make([]string, 0, len(parquetFields))
+						for _, f := range parquetFields {
+							fieldNames = append(fieldNames, f.Name())
+						}
+
+						b.Field(0).(*array.StringBuilder).AppendValues(fieldNames, nil)
+
+						record := b.NewRecord()
+						if err := callback(ctx, record); err != nil {
+							return err
+						}
+						record.Release()
+						b.Release()
 					case dynparquet.DynamicRowGroup:
 						if rg == nil {
 							return errors.New("received nil rowGroup") // shouldn't happen, but anyway
@@ -911,11 +986,11 @@ func (t *Table) SchemaIterator(
 					}
 				}
 			}
-		})
+		}, t.logger))
 	}
 
 	errg.Go(func() error {
-		if err := t.collectRowGroups(ctx, tx, iterOpts.Filter, rowGroups); err != nil {
+		if err := t.collectRowGroups(ctx, tx, iterOpts.Filter, iterOpts.ReadMode, rowGroups); err != nil {
 			return err
 		}
 		close(rowGroups)
@@ -932,31 +1007,43 @@ func generateULID() ulid.ULID {
 }
 
 func newTableBlock(table *Table, prevTx, tx uint64, id ulid.ULID) (*TableBlock, error) {
-	index := atomic.Pointer[btree.BTree]{}
-	index.Store(btree.New(table.db.columnStore.indexDegree))
-
-	return &TableBlock{
+	tb := &TableBlock{
 		table:  table,
-		index:  &index,
 		mtx:    &sync.RWMutex{},
 		ulid:   id,
-		size:   &atomic.Int64{},
 		logger: table.logger,
 		tracer: table.tracer,
 		minTx:  tx,
 		prevTx: prevTx,
-	}, nil
+	}
+
+	var err error
+	tb.index, err = index.NewLSM(
+		filepath.Join(table.db.indexDir(), table.name, id.String()), // Any index files are found at <db.indexDir>/<table.name>/<block.id>
+		table.schema,
+		table.IndexConfig(),
+		table.db.HighWatermark,
+		index.LSMWithMetrics(&table.metrics.indexMetrics),
+		index.LSMWithLogger(table.logger),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("new LSM: %w", err)
+	}
+
+	return tb, nil
 }
 
 // EnsureCompaction forces a TableBlock compaction.
 func (t *TableBlock) EnsureCompaction() error {
-	return t.compact(t.table.db.columnStore.compactionConfig)
+	return t.index.EnsureCompaction()
 }
 
-func (t *TableBlock) InsertRecord(ctx context.Context, tx uint64, record arrow.Record) error {
+func (t *TableBlock) InsertRecord(_ context.Context, tx uint64, record arrow.Record) error {
+	recordSize := util.TotalRecordSize(record)
 	defer func() {
 		t.table.metrics.rowsInserted.Add(float64(record.NumRows()))
 		t.table.metrics.rowInsertSize.Observe(float64(record.NumRows()))
+		t.table.metrics.rowBytesInserted.Add(float64(recordSize))
 	}()
 
 	if record.NumRows() == 0 {
@@ -964,483 +1051,85 @@ func (t *TableBlock) InsertRecord(ctx context.Context, tx uint64, record arrow.R
 		return nil
 	}
 
-	if err := t.insertRecordToGranules(tx, record); err != nil {
-		return fmt.Errorf("failed to insert record into granules: %w", err)
-	}
-
+	t.index.Add(tx, record)
+	t.table.metrics.numParts.Inc()
+	t.uncompressedInsertsSize.Add(recordSize)
 	return nil
-}
-
-func (t *TableBlock) Insert(ctx context.Context, tx uint64, buf *dynparquet.SerializedBuffer) error {
-	defer func() {
-		t.table.metrics.rowsInserted.Add(float64(buf.NumRows()))
-		t.table.metrics.rowInsertSize.Observe(float64(buf.NumRows()))
-	}()
-
-	numRows := buf.NumRows()
-	if numRows == 0 {
-		t.table.metrics.zeroRowsInserted.Add(float64(buf.NumRows()))
-		return nil
-	}
-
-	var dynRows *dynparquet.DynamicRows
-	{
-		rowBuf := make([]parquet.Row, numRows)
-		rows := buf.Reader()
-		defer rows.Close()
-
-		// TODO(asubiotto): Add utility method to read all rows.
-		n := 0
-		for int64(n) < numRows {
-			readN, err := rows.ReadRows(rowBuf[n:])
-			for i := n; i < n+readN; i++ {
-				rowBuf[i] = rowBuf[i].Clone()
-			}
-			n += readN
-			if err != nil {
-				if errors.Is(err, io.EOF) {
-					break
-				}
-				return err
-			}
-		}
-
-		dynRows = dynparquet.NewDynamicRows(
-			rowBuf,
-			buf.ParquetFile().Schema(),
-			buf.DynamicColumns(),
-			buf.ParquetFile().Schema().Fields(),
-		)
-
-		if !dynRows.IsSorted(t.table.config.schema) {
-			// Input rows should be sorted. Eventually, we should return an error.
-			// However, for caution, we just increment a metric and sort the rows.
-			t.table.metrics.unsortedInserts.Inc()
-			sorter := dynparquet.NewDynamicRowSorter(t.table.config.schema, dynRows)
-			sort.Sort(sorter)
-		}
-	}
-
-	rowsToInsertPerGranule, err := t.splitRowsByGranule(dynRows)
-	if err != nil {
-		return fmt.Errorf("failed to split rows by granule: %w", err)
-	}
-
-	b := bytes.NewBuffer(nil)
-	w, err := t.table.config.schema.GetWriter(b, buf.DynamicColumns())
-	if err != nil {
-		return fmt.Errorf("failed to get writer: %w", err)
-	}
-	defer t.table.config.schema.PutWriter(w)
-
-	list := make([]*parts.Part, 0)
-	for granule, indices := range rowsToInsertPerGranule {
-		select {
-		case <-ctx.Done():
-			parts.Tombstone(list)
-			return ctx.Err()
-		default:
-
-			for idx := range dynRows.Rows {
-				// Check if this index belongs in this granule
-				if _, ok := indices[idx]; !ok {
-					continue
-				}
-
-				if _, err = w.WriteRows(dynRows.Rows[idx : idx+1]); err != nil {
-					return fmt.Errorf("failed to write rows: %w", err)
-				}
-			}
-			if err := w.Close(); err != nil {
-				return fmt.Errorf("failed to close writer: %w", err)
-			}
-
-			serBuf, err := dynparquet.ReaderFromBytes(b.Bytes())
-			if err != nil {
-				return fmt.Errorf("failed to get reader from bytes: %w", err)
-			}
-
-			part := parts.NewPart(tx, serBuf)
-			if granule == nil { // insert new granule with part
-				g, err := NewGranule(t.table.config, part)
-				if err != nil {
-					return fmt.Errorf("failed to create granule: %w", err)
-				}
-				t.table.metrics.granulesCreated.Inc()
-
-				for {
-					old := t.Index()
-					t.mtx.Lock()
-					newIndex := old.Clone()
-					t.mtx.Unlock()
-
-					newIndex.ReplaceOrInsert(g)
-					if t.index.CompareAndSwap(old, newIndex) {
-						t.table.metrics.numParts.Add(float64(1))
-						break
-					}
-				}
-			} else {
-				if _, err := granule.Append(part); err != nil {
-					return fmt.Errorf("failed to add part to granule: %w", err)
-				}
-			}
-			list = append(list, part)
-			t.size.Add(serBuf.ParquetFile().Size())
-
-			b = bytes.NewBuffer(nil)
-			w.Reset(b)
-		}
-	}
-
-	t.table.metrics.numParts.Add(float64(len(list)))
-	return nil
-}
-
-// RowGroupIterator iterates in order over all granules in the table.
-// It stops iterating when the iterator function returns false.
-func (t *TableBlock) RowGroupIterator(
-	ctx context.Context,
-	tx uint64,
-	filter TrueNegativeFilter,
-	rowGroups chan<- any,
-) error {
-	ctx, span := t.tracer.Start(ctx, "TableBlock/RowGroupIterator")
-	span.SetAttributes(attribute.Int64("tx", int64(tx))) // Attributes don't support uint64...
-	defer span.End()
-
-	index := t.Index()
-
-	var err error
-	index.Ascend(func(i btree.Item) bool {
-		g := i.(*Granule)
-		g.Collect(ctx, tx, filter, rowGroups)
-		return true
-	})
-
-	return err
 }
 
 // Size returns the cumulative size of all buffers in the table. This is roughly the size of the table in bytes.
 func (t *TableBlock) Size() int64 {
-	return t.size.Load()
+	return t.index.Size()
 }
 
 // Index provides atomic access to the table index.
-func (t *TableBlock) Index() *btree.BTree {
-	return (*btree.BTree)(t.index.Load())
+func (t *TableBlock) Index() *index.LSM {
+	return t.index
 }
 
-func (t *TableBlock) insertRecordToGranules(tx uint64, record arrow.Record) error {
-	ps := t.table.config.schema
-	ri := int64(0)
-	row, err := pqarrow.RecordToDynamicRow(ps, record, int(ri))
-	if err != nil {
-		if err == io.EOF {
-			level.Debug(t.logger).Log("msg", "inserted record with no rows")
-			return nil
-		}
-		return err
-	}
-
-	var prev *Granule
-	var ascendErr error
-	index := t.Index()
-	index.Ascend(func(i btree.Item) bool {
-		g := i.(*Granule)
-
-		for {
-			if t.table.config.schema.RowLessThan(row, g.Least()) {
-				if prev != nil {
-					if _, err := prev.Append(parts.NewArrowPart(tx, record.NewSlice(ri, ri+1), t.table.config.schema)); err != nil {
-						ascendErr = err
-						return false
-					}
-					ri++
-					t.table.metrics.numParts.Add(float64(1))
-
-					row, err = pqarrow.RecordToDynamicRow(ps, record, int(ri))
-					if err != nil {
-						ascendErr = err
-						return false
-					}
-
-					continue
-				}
-				return true
-			}
-
-			// stop at the first granule where this is not the least
-			// this might be the correct granule, but we need to check that it isn't the next granule
-			prev = g
-			return true // continue btree iteration
-		}
-	})
-	if ascendErr != nil {
-		if ascendErr == io.EOF {
-			return nil
-		}
-		return ascendErr
-	}
-
-	if prev == nil { // No suitable granule was found; insert new granule
-		g, err := NewGranule(t.table.config, parts.NewArrowPart(tx, record.NewSlice(ri, record.NumRows()), t.table.config.schema))
-		if err != nil {
-			return fmt.Errorf("new granule failed: %w", err)
-		}
-		t.table.metrics.granulesCreated.Inc()
-
-		for {
-			t.mtx.Lock()
-			newIdx := index.Clone() // NOTE: this needs to be an index swap to avoid losing the new granule during a compaction
-			t.mtx.Unlock()
-
-			newIdx.ReplaceOrInsert(g)
-
-			if t.index.CompareAndSwap(index, newIdx) {
-				t.table.metrics.numParts.Add(float64(1))
-				return nil
-			}
-
-			index = t.Index()
-		}
-	}
-
-	// Append to the last valid granule
-	if _, err := prev.Append(parts.NewArrowPart(tx, record.NewSlice(ri, record.NumRows()), t.table.config.schema)); err != nil && err != io.EOF {
-		return err
-	}
-	t.table.metrics.numParts.Add(float64(1))
-	return nil
-}
-
-type btreeComparableDynamicRow struct {
-	schema *dynparquet.Schema
-	*dynparquet.DynamicRow
-}
-
-func (r btreeComparableDynamicRow) Less(than btree.Item) bool {
-	return r.schema.RowLessThan(r.DynamicRow, than.(*Granule).Least())
-}
-
-func (t *TableBlock) splitRowsByGranule(parquetRows *dynparquet.DynamicRows) (map[*Granule]map[int]struct{}, error) {
-	index := t.Index()
-	if index.Len() == 0 {
-		rows := map[int]struct{}{}
-		for i := 0; i < len(parquetRows.Rows); i++ {
-			rows[i] = struct{}{}
-		}
-
-		return map[*Granule]map[int]struct{}{
-			nil: rows, // NOTE: nil pointer to a granule indicates a new granule must be greated for insertion
-		}, nil
-	}
-
-	var (
-		rowsByGranule = map[*Granule]map[int]struct{}{}
-		idx           = len(parquetRows.Rows) - 1
-	)
-
-	// Imagine our index looks like (in sorted order):
-	// [a, c) [c, h) [h, inf)
-	// Note that the "end" range bounds are implicit and defined by the least
-	// row of the next granule.
-	// If we insert 2 rows, [d, k], the DescendLessOrEqual call will return
-	// granule [h, inf) as a starting point for our descent. The rows to insert
-	// are iterated in reverse order until a row is found that does not belong
-	// to the current granule (e.g. d, since it's less than h). At this point,
-	// the iteration is continued to granule [c, h) into which d is inserted.
-	index.DescendLessOrEqual(
-		btreeComparableDynamicRow{
-			schema:     t.table.config.schema,
-			DynamicRow: parquetRows.Get(idx),
-		},
-		func(i btree.Item) bool {
-			g := i.(*Granule)
-			// Descend the rows to insert until we find a row that does not belong
-			// in this granule.
-			for ; idx >= 0; idx-- {
-				if t.table.config.schema.RowLessThan(parquetRows.Get(idx), g.Least()) {
-					// Go on to the next granule.
-					return true
-				}
-				if _, ok := rowsByGranule[g]; !ok {
-					rowsByGranule[g] = map[int]struct{}{}
-				}
-				rowsByGranule[g][idx] = struct{}{}
-			}
-			// If we got here, all rows were exhausted in the loop above.
-			return false
-		})
-
-	if idx < 0 {
-		// All rows exhausted.
-		return rowsByGranule, nil
-	}
-
-	if _, ok := rowsByGranule[nil]; ok {
-		return nil, errors.New(
-			"unexpectedly found rows that do not belong to any granule before exhausting search",
-		)
-	}
-
-	// Add remaining rows to a new granule.
-	rowsByGranule[nil] = map[int]struct{}{}
-	for ; idx >= 0; idx-- {
-		rowsByGranule[nil][idx] = struct{}{}
-	}
-
-	return rowsByGranule, nil
-}
-
-// addPartToGranule finds the corresponding granule it belongs to in a sorted list of Granules.
-func addPartToGranule(granules []*Granule, p *parts.Part) error {
-	row, err := p.Least()
-	if err != nil {
-		return err
-	}
-
-	var prev *Granule
-	for _, g := range granules {
-		if g.tableConfig.schema.RowLessThan(row, g.Least()) {
-			if prev != nil {
-				if _, err := prev.Append(p); err != nil {
-					return err
-				}
-				return nil
-			}
-		} else {
-			prev = g
-		}
-	}
-
-	if prev != nil {
-		// Save part to prev
-		if _, err := prev.Append(p); err != nil {
-			return err
-		}
-	} else {
-		// NOTE: this should never happen
-		panic("programming error; unable to find granule for part")
-	}
-
-	return nil
-}
-
-// abortCompaction resets state set on compaction so that a granule may be
-// compacted again.
-func (t *TableBlock) abortCompaction(granule *Granule) {
-	t.table.metrics.granulesCompactionAborted.Inc()
-	for {
-		// Unmark pruned, so that we can compact the granule in the future.
-		if granule.metadata.pruned.CompareAndSwap(1, 0) {
-			return
-		}
-	}
-}
-
+// Serialize the table block into a single Parquet file.
 func (t *TableBlock) Serialize(writer io.Writer) error {
-	ctx := context.Background()
-
-	// Read all row groups
-	rowGroups := []dynparquet.DynamicRowGroup{}
-
-	rowGroupsChan := make(chan any)
-
-	errg := &errgroup.Group{}
-	errg.Go(func() error {
-		for rg := range rowGroupsChan {
-			switch p := rg.(type) {
-			case arrow.Record:
-				b := &bytes.Buffer{}
-				w, err := t.table.config.schema.GetWriter(b, pqarrow.RecordDynamicCols(p))
-				if err != nil {
-					return err
-				}
-
-				if err := pqarrow.RecordToFile(t.table.config.schema, w.ParquetWriter(), p); err != nil {
-					return err
-				}
-
-				f, err := parquet.OpenFile(bytes.NewReader(b.Bytes()), int64(b.Len()))
-				if err != nil {
-					return err
-				}
-
-				buf, err := dynparquet.NewSerializedBuffer(f)
-				if err != nil {
-					return err
-				}
-
-				rowGroups = append(rowGroups, buf.MultiDynamicRowGroup())
-
-			case dynparquet.DynamicRowGroup:
-				rowGroups = append(rowGroups, p)
-			default:
-				return fmt.Errorf("unknown part type: %T", p)
-			}
-		}
-		return nil
-	})
-
-	// Collect all the row groups just to determine the dynamic cols
-	err := t.RowGroupIterator(ctx, math.MaxUint64, &AlwaysTrueFilter{}, rowGroupsChan)
-	if err != nil {
-		return err
-	}
-
-	close(rowGroupsChan)
-	if err := errg.Wait(); err != nil {
-		return err
-	}
-
-	// Iterate over all the row groups, and write them to storage
-	return t.writeRowGroups(writer, rowGroups)
+	return t.index.Rotate(t.table.externalParquetCompaction(writer))
 }
 
-// writeRowGroups writes a set of dynamic row groups to a writer.
-func (t *TableBlock) writeRowGroups(writer io.Writer, rowGroups []dynparquet.DynamicRowGroup) error {
-	merged, err := t.table.config.schema.MergeDynamicRowGroups(rowGroups)
-	if err != nil {
-		return err
-	}
-
-	cols := merged.DynamicColumns()
-	rows := merged.Rows()
-	defer rows.Close()
-
-	_, err = t.writeRows(writer, rows, cols, 0)
-	return err
+type ParquetWriter interface {
+	Flush() error
+	WriteRows([]parquet.Row) (int, error)
+	io.Closer
 }
 
-// writeRows writes the given rows to a writer. Up to maxNumRows will be
-// written. If 0, all rows will be written. The number of rows written is
-// returned.
-func (t *TableBlock) writeRows(
-	writer io.Writer, rows parquet.Rows, dynCols map[string][]string, maxNumRows int,
-) (int, error) {
-	w, err := t.table.config.schema.GetWriter(writer, dynCols)
-	if err != nil {
-		return 0, err
-	}
-	defer t.table.config.schema.PutWriter(w)
-	defer w.Close()
+// parquetRowWriter is a stateful parquet row group writer.
+type parquetRowWriter struct {
+	schema *dynparquet.Schema
+	w      ParquetWriter
 
+	rowGroupSize int
+	maxNumRows   int
+
+	rowGroupRowsWritten int
+	totalRowsWritten    int
+	rowsBuf             []parquet.Row
+}
+
+type parquetRowWriterOption func(p *parquetRowWriter)
+
+// rowWriter returns a new Parquet row writer with the given dynamic columns.
+// TODO(asubiotto): Can we delete this parquetRowWriter?
+func (t *TableBlock) rowWriter(w ParquetWriter, options ...parquetRowWriterOption) (*parquetRowWriter, error) {
 	buffSize := 256
-	if t.table.config.rowGroupSize > 0 {
-		buffSize = t.table.config.rowGroupSize
+	config := t.table.config.Load()
+	if config.RowGroupSize > 0 {
+		buffSize = int(config.RowGroupSize)
 	}
 
-	rowGroupRowsWritten := 0
-	totalRowsWritten := 0
-	for maxNumRows == 0 || totalRowsWritten < maxNumRows {
-		rowsBuf := make([]parquet.Row, buffSize)
-		if maxNumRows != 0 && totalRowsWritten+len(rowsBuf) > maxNumRows {
+	p := &parquetRowWriter{
+		w:            w,
+		schema:       t.table.schema,
+		rowsBuf:      make([]parquet.Row, buffSize),
+		rowGroupSize: int(config.RowGroupSize),
+	}
+
+	for _, option := range options {
+		option(p)
+	}
+
+	return p, nil
+}
+
+// WriteRows will write the given rows to the underlying Parquet writer. It returns the number of rows written.
+func (p *parquetRowWriter) writeRows(rows parquet.RowReader) (int, error) {
+	written := 0
+	for p.maxNumRows == 0 || p.totalRowsWritten < p.maxNumRows {
+		if p.rowGroupSize > 0 && p.rowGroupRowsWritten+len(p.rowsBuf) > p.rowGroupSize {
+			// Read only as many rows as we need to complete the row group size limit.
+			p.rowsBuf = p.rowsBuf[:p.rowGroupSize-p.rowGroupRowsWritten]
+		}
+		if p.maxNumRows != 0 && p.totalRowsWritten+len(p.rowsBuf) > p.maxNumRows {
 			// Read only as many rows as we need to write if they would bring
 			// us over the limit.
-			rowsBuf = rowsBuf[:maxNumRows-totalRowsWritten]
+			p.rowsBuf = p.rowsBuf[:p.maxNumRows-p.totalRowsWritten]
 		}
-		n, err := rows.ReadRows(rowsBuf)
+		n, err := rows.ReadRows(p.rowsBuf)
 		if err != nil && err != io.EOF {
 			return 0, err
 		}
@@ -1448,22 +1137,29 @@ func (t *TableBlock) writeRows(
 			break
 		}
 
-		if _, err = w.WriteRows(rowsBuf[:n]); err != nil {
+		if _, err = p.w.WriteRows(p.rowsBuf[:n]); err != nil {
 			return 0, err
 		}
-		rowGroupRowsWritten += n
-		totalRowsWritten += n
-		if t.table.config.rowGroupSize > 0 && rowGroupRowsWritten >= t.table.config.rowGroupSize {
-			if err := w.Flush(); err != nil {
+		written += n
+		p.rowGroupRowsWritten += n
+		p.totalRowsWritten += n
+		if p.rowGroupSize > 0 && p.rowGroupRowsWritten >= p.rowGroupSize {
+			if err := p.w.Flush(); err != nil {
 				return 0, err
 			}
-			rowGroupRowsWritten = 0
+			p.rowGroupRowsWritten = 0
 		}
 	}
 
-	return totalRowsWritten, nil
+	return written, nil
 }
 
+func (p *parquetRowWriter) close() error {
+	return p.w.Close()
+}
+
+// memoryBlocks collects the active and pending blocks that are currently resident in memory.
+// The pendingReadersWg.Done() function must be called on all blocks returned once processing is finished.
 func (t *Table) memoryBlocks() ([]*TableBlock, uint64) {
 	t.mtx.RLock()
 	defer t.mtx.RUnlock()
@@ -1473,8 +1169,10 @@ func (t *Table) memoryBlocks() ([]*TableBlock, uint64) {
 	}
 
 	lastReadBlockTimestamp := t.active.ulid.Time()
+	t.active.pendingReadersWg.Add(1)
 	memoryBlocks := []*TableBlock{t.active}
 	for block := range t.pendingBlocks {
+		block.pendingReadersWg.Add(1)
 		memoryBlocks = append(memoryBlocks, block)
 
 		if block.ulid.Time() < lastReadBlockTimestamp {
@@ -1490,30 +1188,62 @@ func (t *Table) collectRowGroups(
 	ctx context.Context,
 	tx uint64,
 	filterExpr logicalplan.Expr,
+	readMode logicalplan.ReadMode,
 	rowGroups chan<- any,
 ) error {
 	ctx, span := t.tracer.Start(ctx, "Table/collectRowGroups")
 	defer span.End()
 
-	filter, err := BooleanExpr(filterExpr)
-	if err != nil {
-		return err
-	}
-
 	// pending blocks could be uploaded to the bucket while we iterate on them.
 	// to avoid to iterate on them again while reading the block file
 	// we keep the last block timestamp to be read from the bucket and pass it to the IterateBucketBlocks() function
 	// so that every block with a timestamp >= lastReadBlockTimestamp is discarded while being read.
-	memoryBlocks, lastBlockTimestamp := t.memoryBlocks()
-	for _, block := range memoryBlocks {
-		span.AddEvent("memoryBlock")
-		if err := block.RowGroupIterator(ctx, tx, filter, rowGroups); err != nil {
-			return err
+	var lastBlockTimestamp uint64
+	if readMode != logicalplan.ReadModeDataSourcesOnly {
+		memoryBlocks, lbt := t.memoryBlocks()
+		lastBlockTimestamp = lbt
+		defer func() {
+			for _, block := range memoryBlocks {
+				block.pendingReadersWg.Done()
+			}
+		}()
+		for _, block := range memoryBlocks {
+			if err := block.index.Scan(ctx, "", t.schema, filterExpr, tx, func(ctx context.Context, v any) error {
+				select {
+				case <-ctx.Done():
+					if rg, ok := v.(index.ReleaseableRowGroup); ok {
+						rg.Release()
+					}
+					return ctx.Err()
+				case rowGroups <- v:
+					return nil
+				}
+			}); err != nil {
+				return err
+			}
 		}
 	}
 
-	if err := t.IterateBucketBlocks(ctx, t.logger, lastBlockTimestamp, filter, rowGroups); err != nil {
-		return err
+	if readMode == logicalplan.ReadModeInMemoryOnly {
+		return nil
+	}
+
+	// Collect from all other data sources.
+	for _, source := range t.db.sources {
+		span.AddEvent(fmt.Sprintf("source/%s", source.String()))
+		if err := source.Scan(ctx, filepath.Join(t.db.name, t.name), t.schema, filterExpr, lastBlockTimestamp, func(ctx context.Context, v any) error {
+			select {
+			case <-ctx.Done():
+				if rg, ok := v.(index.ReleaseableRowGroup); ok {
+					rg.Release()
+				}
+				return ctx.Err()
+			case rowGroups <- v:
+				return nil
+			}
+		}); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -1526,4 +1256,283 @@ func (t *Table) close() {
 
 	t.active.pendingWritersWg.Wait()
 	t.closing = true
+	t.active.index.WaitForPendingCompactions()
+}
+
+func (t *Table) externalParquetCompaction(writer io.Writer) func(compact []parts.Part) (parts.Part, int64, int64, error) {
+	return func(compact []parts.Part) (parts.Part, int64, int64, error) {
+		size, err := t.compactParts(writer, compact)
+		if err != nil {
+			return nil, 0, 0, err
+		}
+
+		return nil, size, 0, nil
+	}
+}
+
+// compactParts will compact the given parts into a Parquet file written to w.
+// It returns the size in bytes of the compacted parts.
+func (t *Table) compactParts(w io.Writer, compact []parts.Part, options ...parquet.WriterOption) (int64, error) {
+	if len(compact) == 0 {
+		return 0, nil
+	}
+
+	preCompactionSize := int64(0)
+	for _, p := range compact {
+		preCompactionSize += p.Size()
+	}
+
+	if t.schema.UniquePrimaryIndex {
+		distinctRecords, err := t.distinctRecordsForCompaction(compact)
+		if err != nil {
+			return 0, err
+		}
+		if distinctRecords != nil {
+			// Arrow distinction was successful.
+			defer func() {
+				for _, r := range distinctRecords {
+					r.Release()
+				}
+			}()
+			// Note that the records must be sorted (sortInput=true) because
+			// there is no guarantee that order is maintained.
+			return preCompactionSize, t.writeRecordsToParquet(w, distinctRecords, true, options...)
+		}
+	}
+
+	bufs, err := t.buffersForCompaction(w, compact, options...)
+	if err != nil {
+		return 0, err
+	}
+	if bufs == nil {
+		// Optimization.
+		return preCompactionSize, nil
+	}
+
+	merged, err := t.schema.MergeDynamicRowGroups(bufs)
+	if err != nil {
+		return 0, err
+	}
+	err = func() error {
+		var writer dynparquet.ParquetWriter
+		if len(options) > 0 {
+			writer, err = t.schema.NewWriter(w, merged.DynamicColumns(), false, options...)
+			if err != nil {
+				return err
+			}
+		} else {
+			pw, err := t.schema.GetWriter(w, merged.DynamicColumns(), false)
+			if err != nil {
+				return err
+			}
+			defer t.schema.PutWriter(pw)
+			writer = pw.ParquetWriter
+		}
+		p, err := t.active.rowWriter(writer)
+		if err != nil {
+			return err
+		}
+		defer p.close()
+
+		rows := merged.Rows()
+		defer rows.Close()
+
+		var rowReader parquet.RowReader = rows
+		if t.schema.UniquePrimaryIndex {
+			// Given all inputs are sorted, we can deduplicate the rows using
+			// DedupeRowReader, which deduplicates consecutive rows that are
+			// equal on the sorting columns.
+			rowReader = parquet.DedupeRowReader(rows, merged.Schema().Comparator(merged.SortingColumns()...))
+		}
+
+		if _, err := p.writeRows(rowReader); err != nil {
+			return err
+		}
+
+		return nil
+	}()
+	if err != nil {
+		return 0, err
+	}
+
+	return preCompactionSize, nil
+}
+
+// buffersForCompaction, given a slice of possibly overlapping parts, returns
+// the minimum slice of dynamic row groups to be merged together for compaction.
+// If nil, nil is returned, the resulting serialized buffer is written directly
+// to w as an optimization.
+func (t *Table) buffersForCompaction(w io.Writer, inputParts []parts.Part, options ...parquet.WriterOption) ([]dynparquet.DynamicRowGroup, error) {
+	nonOverlappingParts, overlappingParts, err := parts.FindMaximumNonOverlappingSet(t.schema, inputParts)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]dynparquet.DynamicRowGroup, 0, len(inputParts))
+	for _, p := range overlappingParts {
+		buf, err := p.AsSerializedBuffer(t.schema)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, buf.MultiDynamicRowGroup())
+	}
+	if len(nonOverlappingParts) == 0 {
+		return result, nil
+	}
+
+	allArrow := true
+	for _, p := range nonOverlappingParts {
+		if p.Record() == nil {
+			allArrow = false
+			break
+		}
+	}
+	if len(nonOverlappingParts) == 1 || !allArrow {
+		// Not worth doing anything if only one part does not overlap. If there
+		// is at least one non-arrow part then optimizations cannot be made.
+		nonOverlappingRowGroups := make([]dynparquet.DynamicRowGroup, 0, len(nonOverlappingParts))
+		for _, p := range nonOverlappingParts {
+			buf, err := p.AsSerializedBuffer(t.schema)
+			if err != nil {
+				return nil, err
+			}
+			nonOverlappingRowGroups = append(nonOverlappingRowGroups, buf.MultiDynamicRowGroup())
+		}
+		merged := nonOverlappingRowGroups[0]
+		if len(nonOverlappingRowGroups) > 1 {
+			// WithAlreadySorted ensures that a parquet.MultiRowGroup is created
+			// here, which is much cheaper than actually merging all these row
+			// groups.
+			merged, err = t.schema.MergeDynamicRowGroups(nonOverlappingRowGroups, dynparquet.WithAlreadySorted())
+			if err != nil {
+				return nil, err
+			}
+		}
+		result = append(result, merged)
+		return result, nil
+	}
+
+	// All the non-overlapping parts are arrow records, and can therefore be
+	// directly written to a parquet file. If there are no overlapping parts,
+	// write directly to w.
+	var b bytes.Buffer
+	if len(overlappingParts) > 0 {
+		w = &b
+	}
+
+	records := make([]arrow.Record, 0, len(nonOverlappingParts))
+	for _, p := range nonOverlappingParts {
+		records = append(records, p.Record())
+	}
+
+	if err := t.writeRecordsToParquet(w, records, false, options...); err != nil {
+		return nil, err
+	}
+
+	if len(overlappingParts) == 0 {
+		// Result was written directly to w.
+		return nil, nil
+	}
+
+	buf, err := dynparquet.ReaderFromBytes(b.Bytes())
+	if err != nil {
+		return nil, err
+	}
+	result = append(result, buf.MultiDynamicRowGroup())
+	return result, nil
+}
+
+func (t *Table) writeRecordsToParquet(w io.Writer, records []arrow.Record, sortInput bool, options ...parquet.WriterOption) error {
+	dynColSets := make([]map[string][]string, 0, len(records))
+	for _, r := range records {
+		dynColSets = append(dynColSets, pqarrow.RecordDynamicCols(r))
+	}
+	dynCols := dynparquet.MergeDynamicColumnSets(dynColSets)
+	var writer dynparquet.ParquetWriter
+	if len(options) > 0 {
+		var err error
+		writer, err = t.schema.NewWriter(w, dynCols, false, options...)
+		if err != nil {
+			return err
+		}
+	} else {
+		pw, err := t.schema.GetWriter(w, dynCols, sortInput)
+		if err != nil {
+			return err
+		}
+		defer t.schema.PutWriter(pw)
+		writer = pw
+	}
+
+	return pqarrow.RecordsToFile(t.schema, writer, records)
+}
+
+// distinctRecordsForCompaction performs a distinct on the given parts. If at
+// least one non-arrow part is found, nil, nil is returned in which case, the
+// caller should fall back to normal compaction. On success, the caller is
+// responsible for releasing the returned records.
+func (t *Table) distinctRecordsForCompaction(compact []parts.Part) ([]arrow.Record, error) {
+	sortingCols := t.schema.ColumnDefinitionsForSortingColumns()
+	columnExprs := make([]logicalplan.Expr, 0, len(sortingCols))
+	for _, col := range sortingCols {
+		var expr logicalplan.Expr
+		if col.Dynamic {
+			expr = logicalplan.DynCol(col.Name)
+		} else {
+			expr = logicalplan.Col(col.Name)
+		}
+		columnExprs = append(columnExprs, expr)
+	}
+
+	d := physicalplan.Distinct(memory.NewGoAllocator(), t.tracer, columnExprs)
+	output := physicalplan.OutputPlan{}
+	newRecords := make([]arrow.Record, 0)
+	output.SetNextCallback(func(_ context.Context, r arrow.Record) error {
+		r.Retain()
+		newRecords = append(newRecords, r)
+		return nil
+	})
+	d.SetNext(&output)
+
+	if ok, err := func() (bool, error) {
+		ctx := context.TODO()
+		for _, p := range compact {
+			if p.Record() == nil {
+				// Caller should fall back to parquet distinction.
+				return false, nil
+			}
+			if err := d.Callback(ctx, p.Record()); err != nil {
+				return false, err
+			}
+		}
+		if err := d.Finish(ctx); err != nil {
+			return false, err
+		}
+		return true, nil
+	}(); !ok || err != nil {
+		for _, r := range newRecords {
+			r.Release()
+		}
+		return nil, err
+	}
+	return newRecords, nil
+}
+
+// IndexConfig returns the index configuration for the table. It makes a copy of the column store index config and injects it's compactParts method.
+func (t *Table) IndexConfig() []*index.LevelConfig {
+	config := make([]*index.LevelConfig, 0, len(t.db.columnStore.indexConfig))
+	for i, c := range t.db.columnStore.indexConfig {
+		compactFunc := t.compactParts
+		if i == len(t.db.columnStore.indexConfig)-1 {
+			// The last level is the in-memory level, which is never compacted.
+			compactFunc = nil
+		}
+		config = append(config, &index.LevelConfig{
+			Level:   c.Level,
+			MaxSize: c.MaxSize,
+			Type:    c.Type,
+			Compact: compactFunc, // TODO: this is bad and it should feel bad. We shouldn't need the table object to define how parts are compacted. Refactor needed.
+		})
+	}
+
+	return config
 }

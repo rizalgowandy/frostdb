@@ -9,14 +9,18 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	"github.com/apache/arrow/go/v10/arrow"
-	"github.com/apache/arrow/go/v10/arrow/array"
+	"github.com/apache/arrow/go/v17/arrow"
+	"github.com/apache/arrow/go/v17/arrow/array"
+	"github.com/apache/arrow/go/v17/arrow/memory"
 	"github.com/cockroachdb/datadriven"
 	"github.com/google/uuid"
-	"github.com/segmentio/parquet-go"
+	"github.com/parquet-go/parquet-go"
 
 	"github.com/polarsignals/frostdb/dynparquet"
+	schemapb "github.com/polarsignals/frostdb/gen/proto/go/frostdb/schema/v1alpha1"
+	"github.com/polarsignals/frostdb/pqarrow"
 	"github.com/polarsignals/frostdb/query"
+	"github.com/polarsignals/frostdb/query/logicalplan"
 	"github.com/polarsignals/frostdb/sqlparse"
 )
 
@@ -52,26 +56,27 @@ const (
 )
 
 type DB interface {
-	CreateTable(name string, schema *dynparquet.Schema) (Table, error)
+	CreateTable(name string, schema *schemapb.Schema) (Table, error)
 	// ScanTable returns a query.Builder prepared to scan the given table.
 	ScanTable(name string) query.Builder
 }
 
 type Table interface {
 	Schema() *dynparquet.Schema
-	InsertBuffer(context.Context, *dynparquet.Buffer) (uint64, error)
+	InsertRecord(context.Context, arrow.Record) (uint64, error)
 }
 
 type Runner struct {
 	db                        DB
-	schemas                   map[string]*dynparquet.Schema
+	schemas                   map[string]*schemapb.Schema
 	activeTable               Table
 	activeTableName           string
+	activeTableParquetSchema  *parquet.Schema
 	activeTableDynamicColumns []string
 	sqlParser                 *sqlparse.Parser
 }
 
-func NewRunner(db DB, schemas map[string]*dynparquet.Schema) *Runner {
+func NewRunner(db DB, schemas map[string]*schemapb.Schema) *Runner {
 	return &Runner{
 		db:        db,
 		schemas:   schemas,
@@ -101,8 +106,8 @@ func (r *Runner) handleCmd(ctx context.Context, c *datadriven.TestData) (string,
 	return "", fmt.Errorf("unknown command %s", c.Cmd)
 }
 
-func (r *Runner) handleCreateTable(ctx context.Context, c *datadriven.TestData) (string, error) {
-	var schema *dynparquet.Schema
+func (r *Runner) handleCreateTable(_ context.Context, c *datadriven.TestData) (string, error) {
+	var schema *schemapb.Schema
 	for _, arg := range c.CmdArgs {
 		if arg.Key == "schema" {
 			if len(arg.Vals) != 1 {
@@ -123,7 +128,8 @@ func (r *Runner) handleCreateTable(ctx context.Context, c *datadriven.TestData) 
 	}
 	r.activeTable = table
 	r.activeTableName = name
-	for _, c := range schema.Columns() {
+	r.activeTableParquetSchema = table.Schema().ParquetSchema()
+	for _, c := range table.Schema().Columns() {
 		if c.Dynamic {
 			r.activeTableDynamicColumns = append(r.activeTableDynamicColumns, c.Name)
 		}
@@ -217,7 +223,15 @@ func (r *Runner) handleInsert(ctx context.Context, c *datadriven.TestData) (stri
 				if err != nil {
 					return "", fmt.Errorf("insert: %w", err)
 				}
-				rows[i] = append(rows[i], parquet.ValueOf(v).Level(0, 0, colIdx))
+				if col.StorageLayout.Optional() {
+					if parquet.ValueOf(v).IsNull() {
+						rows[i] = append(rows[i], parquet.ValueOf(v).Level(0, 0, colIdx))
+					} else {
+						rows[i] = append(rows[i], parquet.ValueOf(v).Level(0, 1, colIdx))
+					}
+				} else {
+					rows[i] = append(rows[i], parquet.ValueOf(v).Level(0, 0, colIdx))
+				}
 				colIdx++
 				continue
 			}
@@ -227,7 +241,13 @@ func (r *Runner) handleInsert(ctx context.Context, c *datadriven.TestData) (stri
 				if err != nil {
 					return "", fmt.Errorf("insert: %w", err)
 				}
-				rows[i] = append(rows[i], parquet.ValueOf(v).Level(0, 1, colIdx))
+				parquetV := parquet.ValueOf(v)
+				if parquetV.IsNull() {
+					parquetV = parquetV.Level(0, 0, colIdx)
+				} else {
+					parquetV = parquetV.Level(0, 1, colIdx)
+				}
+				rows[i] = append(rows[i], parquetV)
 				colIdx++
 			}
 		}
@@ -241,8 +261,20 @@ func (r *Runner) handleInsert(ctx context.Context, c *datadriven.TestData) (stri
 	if _, err := buf.WriteRows(rows); err != nil {
 		return "", fmt.Errorf("insert: %w", err)
 	}
+	buf.Sort()
 
-	if _, err := r.activeTable.InsertBuffer(ctx, buf); err != nil {
+	// TODO: https://github.com/polarsignals/frostdb/issues/548 Should just build the arrow record directly.
+	converter := pqarrow.NewParquetConverter(memory.NewGoAllocator(), logicalplan.IterOptions{})
+	defer converter.Close()
+
+	if err := converter.Convert(ctx, buf, schema); err != nil {
+		return "", err
+	}
+
+	rec := converter.NewRecord()
+	defer rec.Release()
+
+	if _, err := r.activeTable.InsertRecord(ctx, rec); err != nil {
 		return "", fmt.Errorf("insert: %w", err)
 	}
 
@@ -263,6 +295,12 @@ func stringToValue(t parquet.Type, stringValue string) (any, error) {
 			return nil, fmt.Errorf("unexpected error converting %s to int: %w", stringValue, err)
 		}
 		return intValue, nil
+	case parquet.Double:
+		floatValue, err := strconv.ParseFloat(stringValue, 64)
+		if err != nil {
+			return nil, fmt.Errorf("unexpected error converting %s to float: %w", stringValue, err)
+		}
+		return floatValue, nil
 	case parquet.Boolean:
 		switch stringValue {
 		case "true":
@@ -348,9 +386,14 @@ func (r *Runner) handleExec(ctx context.Context, c *datadriven.TestData) (string
 	return b.String(), nil
 }
 
-func (r *Runner) parseSQL(dynColNames []string, sql string) (sqlparse.ParseResult, error) {
+func (r *Runner) parseSQL(
+	dynColNames []string,
+	sql string,
+) (sqlparse.ParseResult, error) {
 	res, err := r.sqlParser.ExperimentalParse(
-		r.db.ScanTable(r.activeTableName), dynColNames, sql,
+		r.db.ScanTable(r.activeTableName),
+		dynColNames,
+		sql,
 	)
 	if err != nil {
 		return sqlparse.ParseResult{}, err
@@ -377,6 +420,22 @@ func arrayToStringVals(a arrow.Array) ([]string, error) {
 				continue
 			}
 			result[i] = strconv.Itoa(int(col.Value(i)))
+		}
+	case *array.Uint64:
+		for i := range result {
+			if col.IsNull(i) {
+				result[i] = nullString
+				continue
+			}
+			result[i] = strconv.FormatUint(col.Value(i), 10)
+		}
+	case *array.Float64:
+		for i := range result {
+			if col.IsNull(i) {
+				result[i] = nullString
+				continue
+			}
+			result[i] = fmt.Sprintf("%f", float64(col.Value(i)))
 		}
 	case *array.Boolean:
 		for i := range result {

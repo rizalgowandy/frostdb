@@ -5,14 +5,15 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/apache/arrow/go/v10/arrow"
-	"github.com/apache/arrow/go/v10/arrow/array"
-	"github.com/apache/arrow/go/v10/arrow/memory"
+	"github.com/apache/arrow/go/v17/arrow"
+	"github.com/apache/arrow/go/v17/arrow/array"
+	"github.com/apache/arrow/go/v17/arrow/memory"
 	"github.com/google/uuid"
-	"github.com/segmentio/parquet-go"
+	"github.com/parquet-go/parquet-go"
 	"github.com/stretchr/testify/require"
 
 	"github.com/polarsignals/frostdb/dynparquet"
+	schemapb "github.com/polarsignals/frostdb/gen/proto/go/frostdb/schema/v1alpha1"
 	"github.com/polarsignals/frostdb/query/logicalplan"
 )
 
@@ -20,9 +21,9 @@ func TestDifferentSchemasToArrow(t *testing.T) {
 	dynSchema := dynparquet.NewSampleSchema()
 
 	samples := dynparquet.Samples{{
-		Labels: []dynparquet.Label{
-			{Name: "label1", Value: "value1"},
-			{Name: "label2", Value: "value2"},
+		Labels: map[string]string{
+			"label1": "value1",
+			"label2": "value2",
 		},
 		Stacktrace: []uuid.UUID{
 			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -32,14 +33,14 @@ func TestDifferentSchemasToArrow(t *testing.T) {
 		Value:     1,
 	}}
 
-	buf0, err := samples.ToBuffer(dynSchema)
+	buf0, err := dynparquet.ToBuffer(samples, dynSchema)
 	require.NoError(t, err)
 
 	samples = dynparquet.Samples{{
-		Labels: []dynparquet.Label{
-			{Name: "label1", Value: "value2"},
-			{Name: "label2", Value: "value2"},
-			{Name: "label3", Value: "value3"},
+		Labels: map[string]string{
+			"label1": "value2",
+			"label2": "value2",
+			"label3": "value3",
 		},
 		Stacktrace: []uuid.UUID{
 			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -49,14 +50,14 @@ func TestDifferentSchemasToArrow(t *testing.T) {
 		Value:     2,
 	}}
 
-	buf1, err := samples.ToBuffer(dynSchema)
+	buf1, err := dynparquet.ToBuffer(samples, dynSchema)
 	require.NoError(t, err)
 
 	samples = dynparquet.Samples{{
-		Labels: []dynparquet.Label{
-			{Name: "label1", Value: "value3"},
-			{Name: "label2", Value: "value2"},
-			{Name: "label4", Value: "value4"},
+		Labels: map[string]string{
+			"label1": "value3",
+			"label2": "value2",
+			"label4": "value4",
 		},
 		Stacktrace: []uuid.UUID{
 			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -66,13 +67,13 @@ func TestDifferentSchemasToArrow(t *testing.T) {
 		Value:     3,
 	}}
 
-	buf2, err := samples.ToBuffer(dynSchema)
+	buf2, err := dynparquet.ToBuffer(samples, dynSchema)
 	require.NoError(t, err)
 
 	samples = dynparquet.Samples{{
-		Labels: []dynparquet.Label{
-			{Name: "label1", Value: "value1"},
-			{Name: "label2", Value: "value2"},
+		Labels: map[string]string{
+			"label1": "value1",
+			"label2": "value2",
 		},
 		Stacktrace: []uuid.UUID{
 			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -82,14 +83,14 @@ func TestDifferentSchemasToArrow(t *testing.T) {
 		Value:     2,
 	}}
 
-	buf3, err := samples.ToBuffer(dynSchema)
+	buf3, err := dynparquet.ToBuffer(samples, dynSchema)
 	require.NoError(t, err)
 
 	samples = dynparquet.Samples{{
-		Labels: []dynparquet.Label{
-			{Name: "label1", Value: "value1"},
-			{Name: "label2", Value: "value2"},
-			{Name: "label3", Value: "value3"},
+		Labels: map[string]string{
+			"label1": "value1",
+			"label2": "value2",
+			"label3": "value3",
 		},
 		Stacktrace: []uuid.UUID{
 			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -99,28 +100,31 @@ func TestDifferentSchemasToArrow(t *testing.T) {
 		Value:     3,
 	}}
 
-	buf4, err := samples.ToBuffer(dynSchema)
+	buf4, err := dynparquet.ToBuffer(samples, dynSchema)
 	require.NoError(t, err)
 
 	ctx := context.Background()
 
-	c := NewParquetConverter(memory.DefaultAllocator, logicalplan.IterOptions{})
+	alloc := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer alloc.AssertSize(t, 0)
+	c := NewParquetConverter(alloc, logicalplan.IterOptions{})
 	defer c.Close()
 
-	require.NoError(t, c.Convert(ctx, buf0))
-	require.NoError(t, c.Convert(ctx, buf1))
-	require.NoError(t, c.Convert(ctx, buf2))
-	require.NoError(t, c.Convert(ctx, buf3))
-	require.NoError(t, c.Convert(ctx, buf4))
+	require.NoError(t, c.Convert(ctx, buf0, dynSchema))
+	require.NoError(t, c.Convert(ctx, buf1, dynSchema))
+	require.NoError(t, c.Convert(ctx, buf2, dynSchema))
+	require.NoError(t, c.Convert(ctx, buf3, dynSchema))
+	require.NoError(t, c.Convert(ctx, buf4, dynSchema))
 
 	ar := c.NewRecord()
+	defer ar.Release()
 	require.Equal(t, int64(8), ar.NumCols())
 	require.Equal(t, int64(5), ar.NumRows())
 	for j := 0; j < int(ar.NumCols()); j++ {
 		switch j {
 		case 0:
-			require.Equal(t, `{ dictionary: []
-  indices: [(null) (null) (null) (null) (null)] }`, fmt.Sprintf("%v", ar.Column(j)))
+			require.Equal(t, `{ dictionary: [""]
+  indices: [0 0 0 0 0] }`, fmt.Sprintf("%v", ar.Column(j)))
 		case 1:
 			require.Equal(t, `{ dictionary: ["value1" "value2" "value3"]
   indices: [0 1 2 0 0] }`, fmt.Sprintf("%v", ar.Column(j)))
@@ -145,9 +149,9 @@ func TestMergeToArrow(t *testing.T) {
 	dynSchema := dynparquet.NewSampleSchema()
 
 	samples := dynparquet.Samples{{
-		Labels: []dynparquet.Label{
-			{Name: "label1", Value: "value1"},
-			{Name: "label2", Value: "value2"},
+		Labels: map[string]string{
+			"label1": "value1",
+			"label2": "value2",
 		},
 		Stacktrace: []uuid.UUID{
 			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -156,10 +160,10 @@ func TestMergeToArrow(t *testing.T) {
 		Timestamp: 1,
 		Value:     1,
 	}, {
-		Labels: []dynparquet.Label{
-			{Name: "label1", Value: "value2"},
-			{Name: "label2", Value: "value2"},
-			{Name: "label3", Value: "value3"},
+		Labels: map[string]string{
+			"label1": "value2",
+			"label2": "value2",
+			"label3": "value3",
 		},
 		Stacktrace: []uuid.UUID{
 			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -168,10 +172,10 @@ func TestMergeToArrow(t *testing.T) {
 		Timestamp: 2,
 		Value:     2,
 	}, {
-		Labels: []dynparquet.Label{
-			{Name: "label1", Value: "value3"},
-			{Name: "label2", Value: "value2"},
-			{Name: "label4", Value: "value4"},
+		Labels: map[string]string{
+			"label1": "value3",
+			"label2": "value2",
+			"label4": "value4",
 		},
 		Stacktrace: []uuid.UUID{
 			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -181,13 +185,13 @@ func TestMergeToArrow(t *testing.T) {
 		Value:     3,
 	}}
 
-	buf1, err := samples.ToBuffer(dynSchema)
+	buf1, err := dynparquet.ToBuffer(samples, dynSchema)
 	require.NoError(t, err)
 
 	samples = dynparquet.Samples{{
-		Labels: []dynparquet.Label{
-			{Name: "label1", Value: "value1"},
-			{Name: "label2", Value: "value2"},
+		Labels: map[string]string{
+			"label1": "value1",
+			"label2": "value2",
 		},
 		Stacktrace: []uuid.UUID{
 			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -197,14 +201,14 @@ func TestMergeToArrow(t *testing.T) {
 		Value:     2,
 	}}
 
-	buf2, err := samples.ToBuffer(dynSchema)
+	buf2, err := dynparquet.ToBuffer(samples, dynSchema)
 	require.NoError(t, err)
 
 	samples = dynparquet.Samples{{
-		Labels: []dynparquet.Label{
-			{Name: "label1", Value: "value1"},
-			{Name: "label2", Value: "value2"},
-			{Name: "label3", Value: "value3"},
+		Labels: map[string]string{
+			"label1": "value1",
+			"label2": "value2",
+			"label3": "value3",
 		},
 		Stacktrace: []uuid.UUID{
 			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -214,7 +218,7 @@ func TestMergeToArrow(t *testing.T) {
 		Value:     3,
 	}}
 
-	buf3, err := samples.ToBuffer(dynSchema)
+	buf3, err := dynparquet.ToBuffer(samples, dynSchema)
 	require.NoError(t, err)
 
 	merge, err := dynSchema.MergeDynamicRowGroups([]dynparquet.DynamicRowGroup{buf1, buf2, buf3})
@@ -222,31 +226,31 @@ func TestMergeToArrow(t *testing.T) {
 
 	ctx := context.Background()
 
-	as, err := ParquetRowGroupToArrowSchema(ctx, merge, logicalplan.IterOptions{})
+	as, err := ParquetRowGroupToArrowSchema(ctx, merge, dynSchema, logicalplan.IterOptions{})
 	require.NoError(t, err)
 	require.Len(t, as.Fields(), 8)
 	require.Equal(t, as.Field(0), arrow.Field{Name: "example_type", Type: &arrow.DictionaryType{
-		IndexType: &arrow.Int16Type{},
+		IndexType: &arrow.Uint32Type{},
 		ValueType: &arrow.BinaryType{},
 	}})
 	require.Equal(t, as.Field(1), arrow.Field{Name: "labels.label1", Type: &arrow.DictionaryType{
-		IndexType: &arrow.Int16Type{},
+		IndexType: &arrow.Uint32Type{},
 		ValueType: &arrow.BinaryType{},
 	}, Nullable: true})
 	require.Equal(t, as.Field(2), arrow.Field{Name: "labels.label2", Type: &arrow.DictionaryType{
-		IndexType: &arrow.Int16Type{},
+		IndexType: &arrow.Uint32Type{},
 		ValueType: &arrow.BinaryType{},
 	}, Nullable: true})
 	require.Equal(t, as.Field(3), arrow.Field{Name: "labels.label3", Type: &arrow.DictionaryType{
-		IndexType: &arrow.Int16Type{},
+		IndexType: &arrow.Uint32Type{},
 		ValueType: &arrow.BinaryType{},
 	}, Nullable: true})
 	require.Equal(t, as.Field(4), arrow.Field{Name: "labels.label4", Type: &arrow.DictionaryType{
-		IndexType: &arrow.Int16Type{},
+		IndexType: &arrow.Uint32Type{},
 		ValueType: &arrow.BinaryType{},
 	}, Nullable: true})
 	require.Equal(t, as.Field(5), arrow.Field{Name: "stacktrace", Type: &arrow.DictionaryType{
-		IndexType: &arrow.Int16Type{},
+		IndexType: &arrow.Uint32Type{},
 		ValueType: &arrow.BinaryType{},
 	}})
 	require.Equal(t, as.Field(6), arrow.Field{Name: "timestamp", Type: &arrow.Int64Type{}})
@@ -254,7 +258,7 @@ func TestMergeToArrow(t *testing.T) {
 
 	c := NewParquetConverter(memory.DefaultAllocator, logicalplan.IterOptions{})
 	defer c.Close()
-	require.NoError(t, c.Convert(ctx, merge))
+	require.NoError(t, c.Convert(ctx, merge, dynSchema))
 	ar := c.NewRecord()
 	require.Equal(t, int64(5), ar.NumRows())
 	require.Equal(t, int64(8), ar.NumCols())
@@ -263,8 +267,10 @@ func TestMergeToArrow(t *testing.T) {
 
 func BenchmarkNestedParquetToArrow(b *testing.B) {
 	dynSchema := dynparquet.NewNestedSampleSchema(b)
+	schema, err := dynparquet.SchemaFromDefinition(dynSchema)
+	require.NoError(b, err)
 
-	pb, err := dynSchema.NewBuffer(map[string][]string{})
+	pb, err := schema.NewBuffer(map[string][]string{})
 	require.NoError(b, err)
 
 	for i := 0; i < 1000; i++ {
@@ -287,7 +293,7 @@ func BenchmarkNestedParquetToArrow(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		require.NoError(b, c.Convert(ctx, pb))
+		require.NoError(b, c.Convert(ctx, pb, schema))
 		// Reset converter.
 		_ = c.NewRecord()
 	}
@@ -299,9 +305,9 @@ func BenchmarkParquetToArrow(b *testing.B) {
 	samples := make(dynparquet.Samples, 0, 1000)
 	for i := 0; i < 1000; i++ {
 		samples = append(samples, dynparquet.Sample{
-			Labels: []dynparquet.Label{
-				{Name: "label1", Value: "value1"},
-				{Name: "label2", Value: "value2"},
+			Labels: map[string]string{
+				"label1": "value1",
+				"label2": "value2",
 			},
 			Stacktrace: []uuid.UUID{
 				{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -312,7 +318,7 @@ func BenchmarkParquetToArrow(b *testing.B) {
 		})
 	}
 
-	buf, err := samples.ToBuffer(dynSchema)
+	buf, err := dynparquet.ToBuffer(samples, dynSchema)
 	require.NoError(b, err)
 
 	ctx := context.Background()
@@ -323,7 +329,7 @@ func BenchmarkParquetToArrow(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		require.NoError(b, c.Convert(ctx, buf))
+		require.NoError(b, c.Convert(ctx, buf, dynSchema))
 		// Reset converter.
 		_ = c.NewRecord()
 	}
@@ -406,9 +412,9 @@ func TestDistinctBinaryExprOptimization(t *testing.T) {
 	dynSchema := dynparquet.NewSampleSchema()
 
 	samples := dynparquet.Samples{{
-		Labels: []dynparquet.Label{
-			{Name: "label1", Value: "value1"},
-			{Name: "label2", Value: "value2"},
+		Labels: map[string]string{
+			"label1": "value1",
+			"label2": "value2",
 		},
 		Stacktrace: []uuid.UUID{
 			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -417,9 +423,9 @@ func TestDistinctBinaryExprOptimization(t *testing.T) {
 		Timestamp: 1,
 		Value:     1,
 	}, {
-		Labels: []dynparquet.Label{
-			{Name: "label1", Value: "value1"},
-			{Name: "label2", Value: "value2"},
+		Labels: map[string]string{
+			"label1": "value1",
+			"label2": "value2",
 		},
 		Stacktrace: []uuid.UUID{
 			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -429,7 +435,7 @@ func TestDistinctBinaryExprOptimization(t *testing.T) {
 		Value:     2,
 	}}
 
-	buf, err := samples.ToBuffer(dynSchema)
+	buf, err := dynparquet.ToBuffer(samples, dynSchema)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -441,6 +447,7 @@ func TestDistinctBinaryExprOptimization(t *testing.T) {
 	as, err := ParquetRowGroupToArrowSchema(
 		ctx,
 		buf,
+		dynSchema,
 		logicalplan.IterOptions{
 			PhysicalProjection: []logicalplan.Expr{
 				logicalplan.Col("example_type"),
@@ -453,7 +460,7 @@ func TestDistinctBinaryExprOptimization(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, as.Fields(), 3)
 	require.Equal(t, as.Field(0), arrow.Field{Name: "example_type", Type: &arrow.DictionaryType{
-		IndexType: &arrow.Int16Type{},
+		IndexType: &arrow.Uint32Type{},
 		ValueType: &arrow.BinaryType{},
 	}})
 	require.Equal(t, as.Field(1), arrow.Field{Name: "timestamp", Type: &arrow.Int64Type{}})
@@ -469,7 +476,7 @@ func TestDistinctBinaryExprOptimization(t *testing.T) {
 			DistinctColumns: distinctColumns,
 		})
 	defer c.Close()
-	require.NoError(t, c.Convert(ctx, buf))
+	require.NoError(t, c.Convert(ctx, buf, dynSchema))
 	ar := c.NewRecord()
 	require.Equal(t, int64(1), ar.NumRows())
 	require.Equal(t, int64(3), ar.NumCols())
@@ -480,9 +487,9 @@ func TestDistinctBinaryExprOptimizationMixed(t *testing.T) {
 	dynSchema := dynparquet.NewSampleSchema()
 
 	samples := dynparquet.Samples{{
-		Labels: []dynparquet.Label{
-			{Name: "label1", Value: "value1"},
-			{Name: "label2", Value: "value2"},
+		Labels: map[string]string{
+			"label1": "value1",
+			"label2": "value2",
 		},
 		Stacktrace: []uuid.UUID{
 			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -491,9 +498,9 @@ func TestDistinctBinaryExprOptimizationMixed(t *testing.T) {
 		Timestamp: 1,
 		Value:     1,
 	}, {
-		Labels: []dynparquet.Label{
-			{Name: "label1", Value: "value1"},
-			{Name: "label2", Value: "value2"},
+		Labels: map[string]string{
+			"label1": "value1",
+			"label2": "value2",
 		},
 		Stacktrace: []uuid.UUID{
 			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -502,9 +509,9 @@ func TestDistinctBinaryExprOptimizationMixed(t *testing.T) {
 		Timestamp: 2,
 		Value:     2,
 	}, {
-		Labels: []dynparquet.Label{
-			{Name: "label1", Value: "value1"},
-			{Name: "label2", Value: "value2"},
+		Labels: map[string]string{
+			"label1": "value1",
+			"label2": "value2",
 		},
 		Stacktrace: []uuid.UUID{
 			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -513,9 +520,9 @@ func TestDistinctBinaryExprOptimizationMixed(t *testing.T) {
 		Timestamp: 3,
 		Value:     0,
 	}, {
-		Labels: []dynparquet.Label{
-			{Name: "label1", Value: "value1"},
-			{Name: "label2", Value: "value2"},
+		Labels: map[string]string{
+			"label1": "value1",
+			"label2": "value2",
 		},
 		Stacktrace: []uuid.UUID{
 			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -525,7 +532,7 @@ func TestDistinctBinaryExprOptimizationMixed(t *testing.T) {
 		Value:     0,
 	}}
 
-	buf, err := samples.ToBuffer(dynSchema)
+	buf, err := dynparquet.ToBuffer(samples, dynSchema)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -537,6 +544,7 @@ func TestDistinctBinaryExprOptimizationMixed(t *testing.T) {
 	as, err := ParquetRowGroupToArrowSchema(
 		ctx,
 		buf,
+		dynSchema,
 		logicalplan.IterOptions{
 			PhysicalProjection: []logicalplan.Expr{
 				logicalplan.Col("example_type"),
@@ -548,7 +556,7 @@ func TestDistinctBinaryExprOptimizationMixed(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, as.Fields(), 3)
 	require.Equal(t, as.Field(0), arrow.Field{Name: "example_type", Type: &arrow.DictionaryType{
-		IndexType: &arrow.Int16Type{},
+		IndexType: &arrow.Uint32Type{},
 		ValueType: &arrow.BinaryType{},
 	}})
 	require.Equal(t, as.Field(1), arrow.Field{Name: "value", Type: &arrow.Int64Type{}})
@@ -562,7 +570,7 @@ func TestDistinctBinaryExprOptimizationMixed(t *testing.T) {
 		DistinctColumns: distinctColumns,
 	})
 	defer c.Close()
-	require.NoError(t, c.Convert(ctx, buf))
+	require.NoError(t, c.Convert(ctx, buf, dynSchema))
 	ar := c.NewRecord()
 	require.Equal(t, int64(2), ar.NumRows())
 	require.Equal(t, int64(3), ar.NumCols())
@@ -582,7 +590,18 @@ func TestList(t *testing.T) {
 
 	c := NewParquetConverter(memory.DefaultAllocator, logicalplan.IterOptions{})
 	defer c.Close()
-	require.NoError(t, c.Convert(ctx, buf))
+	s, err := dynparquet.SchemaFromDefinition(&schemapb.Schema{
+		Name: "test",
+		Columns: []*schemapb.Column{{
+			Name: "data",
+			StorageLayout: &schemapb.StorageLayout{
+				Type:     schemapb.StorageLayout_TYPE_INT64,
+				Repeated: true,
+			},
+		}},
+	})
+	require.NoError(t, err)
+	require.NoError(t, c.Convert(ctx, buf, s))
 
 	record := c.NewRecord()
 	t.Log(record)
@@ -610,7 +629,9 @@ func TestList(t *testing.T) {
 }
 
 func Test_ParquetRowGroupToArrowSchema_Groups(t *testing.T) {
-	schema := dynparquet.NewNestedSampleSchema(t)
+	dynSchema := dynparquet.NewNestedSampleSchema(t)
+	schema, err := dynparquet.SchemaFromDefinition(dynSchema)
+	require.NoError(t, err)
 	buf, err := schema.NewBufferV2(
 		dynparquet.LabelColumn("label1"),
 		dynparquet.LabelColumn("label2"),
@@ -643,7 +664,7 @@ func Test_ParquetRowGroupToArrowSchema_Groups(t *testing.T) {
 						{
 							Name: "label1",
 							Type: &arrow.DictionaryType{
-								IndexType: &arrow.Int16Type{},
+								IndexType: &arrow.Uint32Type{},
 								ValueType: &arrow.BinaryType{},
 							},
 							Nullable: true,
@@ -651,7 +672,7 @@ func Test_ParquetRowGroupToArrowSchema_Groups(t *testing.T) {
 						{
 							Name: "label2",
 							Type: &arrow.DictionaryType{
-								IndexType: &arrow.Int16Type{},
+								IndexType: &arrow.Uint32Type{},
 								ValueType: &arrow.BinaryType{},
 							},
 							Nullable: true,
@@ -680,7 +701,7 @@ func Test_ParquetRowGroupToArrowSchema_Groups(t *testing.T) {
 						{
 							Name: "label1",
 							Type: &arrow.DictionaryType{
-								IndexType: &arrow.Int16Type{},
+								IndexType: &arrow.Uint32Type{},
 								ValueType: &arrow.BinaryType{},
 							},
 							Nullable: true,
@@ -705,7 +726,7 @@ func Test_ParquetRowGroupToArrowSchema_Groups(t *testing.T) {
 						{
 							Name: "label2",
 							Type: &arrow.DictionaryType{
-								IndexType: &arrow.Int16Type{},
+								IndexType: &arrow.Uint32Type{},
 								ValueType: &arrow.BinaryType{},
 							},
 							Nullable: true,
@@ -730,7 +751,7 @@ func Test_ParquetRowGroupToArrowSchema_Groups(t *testing.T) {
 						{
 							Name: "label1",
 							Type: &arrow.DictionaryType{
-								IndexType: &arrow.Int16Type{},
+								IndexType: &arrow.Uint32Type{},
 								ValueType: &arrow.BinaryType{},
 							},
 							Nullable: true,
@@ -738,7 +759,7 @@ func Test_ParquetRowGroupToArrowSchema_Groups(t *testing.T) {
 						{
 							Name: "label2",
 							Type: &arrow.DictionaryType{
-								IndexType: &arrow.Int16Type{},
+								IndexType: &arrow.Uint32Type{},
 								ValueType: &arrow.BinaryType{},
 							},
 							Nullable: true,
@@ -758,6 +779,7 @@ func Test_ParquetRowGroupToArrowSchema_Groups(t *testing.T) {
 			as, err := ParquetRowGroupToArrowSchema(
 				ctx,
 				buf,
+				schema,
 				logicalplan.IterOptions{
 					PhysicalProjection: test.physicalProjections,
 				},
@@ -770,14 +792,18 @@ func Test_ParquetRowGroupToArrowSchema_Groups(t *testing.T) {
 
 func Test_ParquetToArrowV2(t *testing.T) {
 	dynSchema := dynparquet.NewNestedSampleSchema(t)
+	schema, err := dynparquet.SchemaFromDefinition(dynSchema)
+	require.NoError(t, err)
 
 	ctx := context.Background()
-	c := NewParquetConverter(memory.DefaultAllocator, logicalplan.IterOptions{})
+	alloc := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer alloc.AssertSize(t, 0)
+	c := NewParquetConverter(alloc, logicalplan.IterOptions{})
 	defer c.Close()
 
 	n := 10
 	for i := 0; i < n; i++ {
-		pb, err := dynSchema.NewBufferV2(
+		pb, err := schema.NewBufferV2(
 			dynparquet.LabelColumn("label1"),
 			dynparquet.LabelColumn("label2"),
 		)
@@ -793,10 +819,10 @@ func Test_ParquetToArrowV2(t *testing.T) {
 			},
 		})
 		require.NoError(t, err)
-		require.NoError(t, c.Convert(ctx, pb))
+		require.NoError(t, c.Convert(ctx, pb, schema))
 	}
 	r := c.NewRecord()
-	fmt.Println(r)
+	defer r.Release()
 	require.Equal(t, int64(n), r.NumRows())
 }
 
@@ -806,9 +832,9 @@ func Test_ParquetToArrow(t *testing.T) {
 	samples := make(dynparquet.Samples, 0, 1000)
 	for i := 0; i < 1000; i++ {
 		samples = append(samples, dynparquet.Sample{
-			Labels: []dynparquet.Label{
-				{Name: "label1", Value: "value1"},
-				{Name: "label2", Value: "value2"},
+			Labels: map[string]string{
+				"label1": "value1",
+				"label2": "value2",
 			},
 			Stacktrace: []uuid.UUID{
 				{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -819,15 +845,18 @@ func Test_ParquetToArrow(t *testing.T) {
 		})
 	}
 
-	buf, err := samples.ToBuffer(dynSchema)
+	buf, err := dynparquet.ToBuffer(samples, dynSchema)
 	require.NoError(t, err)
 
 	ctx := context.Background()
 
-	c := NewParquetConverter(memory.DefaultAllocator, logicalplan.IterOptions{})
+	alloc := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer alloc.AssertSize(t, 0)
+	c := NewParquetConverter(alloc, logicalplan.IterOptions{})
 	defer c.Close()
 
-	require.NoError(t, c.Convert(ctx, buf))
+	require.NoError(t, c.Convert(ctx, buf, dynSchema))
 	r := c.NewRecord()
+	defer r.Release()
 	require.Equal(t, int64(1000), r.NumRows())
 }
